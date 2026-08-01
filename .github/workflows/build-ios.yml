@@ -1,48 +1,49 @@
-name: Build iOS dylib
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: 拉取代码
-        uses: actions/checkout@v4
+名字: Build iOS dylib
+在:
+推:
+分支: [主要的]
+工作流_调度:
+工作:
+建设:
+连续运行: Ubuntu-最新版
+步伐:
+      - 名字: 拉取仓库源码
+使用: 动作/签出@v4
 
-      - name: 安装编译依赖
-        run: |
-          sudo apt update
-          sudo apt install git cmake clang llvm make wget xz-utils -y
+      - 名字: 安装系统编译依赖
+奔跑: |
+使用使用 sudo apt update -y
+sudo apt install git cmake clang llvm make wget xz-utils -y
 
-      - name: 拉取osxcross交叉编译工具
-        run: |
-          rm -rf ~/osxcross
-          git clone https://github.com/tpoechtrager/osxcross.git ~/osxcross
-          cd ~/osxcross
-          rm -rf tarballs
-          mkdir tarballs
-          wget https://github.com/xybp888/iOS-SDKs/releases/download/iPhoneOS17.0.sdk/iPhoneOS17.0.sdk.tar.xz -O tarballs/iPhoneOS17.0.sdk.tar.xz
-          UNATTENDED=1 ./build.sh
-          echo "export PATH=$HOME/osxcross/target/bin:$PATH" >> ~/.bashrc
-          source ~/.bashrc
+Jürgen 关于关于osxcrossCrossCompiler-Ketten (GitHub)官方 地址）
+你好关于OS xcroscrosscompiler链(GitHub)死于齐格勒地址): |
+rm -rf ~/osxcross
+餐桌克隆https://github.com/tpolichrager/osxcross.git ~/OS x cross
+cd ~/osxcross
+$ HOME/OS x cross/target/SDK/iphone OS 17.0软件开发工具包（软件开发工具包)
+作者 : 作者 : 作者 : 作者 : mkdir tarballs
+# 海外官方软件开发工具包(软件开发工具包)下载地址
+wget https://github。com/xybp 888/iOS-SDK/releases/herunterloaded/iPhone OS 17.0 SDK/iPhone OS 17.0，冯丹的SDK。石油xz-O tarballs/iphone OS 17.0。,冯丹的SDK。石油. xz
+无人值守=1。/build.sh
+回声"导出路径= $ HOME/OS x cross/target/bin:$ PATH "> > ~/。bashrc
+来源~/。bashrc
 
-      - name: CMake编译动态库
-        run: |
-          source ~/.bashrc
-          IOS_SDK="$HOME/osxcross/target/SDK/iPhoneOS17.0.sdk"
-          mkdir build && cd build
-          cmake \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_SYSROOT="${IOS_SDK}" \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DBUILD_SHARED_LIBS=ON \
-            -DCMAKE_BUILD_TYPE=Release \
+      - 名字: CMake编译iOS dylib
+奔跑: |
+来源~/。bashrc
+IOS _ SDK =来源~/。bashrc
+mkdir版本和激光唱片版本
+cmake
+-DCMAKE_SYSTEM_NAME=iOS
+直流电制造_ OSX _系统根=" $ { IOS _ SDK } "
+直流电马克OSX架构=arm64
+-DBUILD_SHARED_LIBS=ON
+-DCMAKE_BUILD_TYPE=Release
             ..
-          make -j4
+品牌-j4
 
-      - name: 上传编译成品
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-lib-output
-          path: build/libIOSVISION.dylib
+      - 名字: 打包输出编译产物
+使用: 动作/上传-工件@v4
+随着:
+名字: IOs-库-输出
+小路: 构建/libio愿景迪利布.
