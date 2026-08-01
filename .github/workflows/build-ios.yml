@@ -15,12 +15,13 @@ jobs:
 
       - name: Compile libIOSVISION.dylib
         run: |
+          mv hook_engine_ios_final.cpp hook_engine_ios_final.mm
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           clang++ -arch arm64 -target arm64-apple-ios12.0 -isysroot "$SDK" \
             -dynamiclib -fobjc-arc -std=c++17 \
             -framework Foundation -framework GameKit \
             -install_name @rpath/libIOSVISION.dylib -Wl,-segalign,4000 \
-            -x objective-c++ hook_engine_ios_final.cpp libdobby.a \
+            hook_engine_ios_final.mm libdobby.a \
             -o libIOSVISION.dylib
 
       - name: Verify
