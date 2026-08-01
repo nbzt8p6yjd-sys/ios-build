@@ -1,45 +1,48 @@
-name: Build iOS Hook
-
+name: Build iOS dylib
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
-
+    branches: [ main ]
+  workflow_dispatch:
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+      - name: 拉取代码
+        uses: actions/checkout@v4
 
-    - name: Setup Xcode
-      uses: maxim-lobanov/setup-xcode@v1
-      with:
-        xcode-version: '15.4'
+      - name: 安装编译依赖
+        run: |
+          sudo apt update
+          sudo apt install git cmake clang llvm make wget xz-utils -y
 
-    - name: Compile dylib
-      run: |
-        SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-        clang++ -arch arm64 \
-          -isysroot "$SDK" \
-          -mios-version-min=12.0 \
-          -framework Foundation \
-          -framework GameKit \
-          -I. \
-          -shared -fPIC -O2 \
-          hook_engine_ios_final.cpp \
-          libdobby.a \
-          -o libIOSVISION.dylib
+      - name: 拉取osxcross交叉编译工具
+        run: |
+          rm -rf ~/osxcross
+          git clone https://github.com/tpoechtrager/osxcross.git ~/osxcross
+          cd ~/osxcross
+          rm -rf tarballs
+          mkdir tarballs
+          wget https://github.com/xybp888/iOS-SDKs/releases/download/iPhoneOS17.0.sdk/iPhoneOS17.0.sdk.tar.xz -O tarballs/iPhoneOS17.0.sdk.tar.xz
+          UNATTENDED=1 ./build.sh
+          echo "export PATH=$HOME/osxcross/target/bin:$PATH" >> ~/.bashrc
+          source ~/.bashrc
 
-    - name: Verify
-      run: |
-        echo "=== Build Result ==="
-        file libIOSVISION.dylib
-        lipo -info libIOSVISION.dylib
-        ls -lh libIOSVISION.dylib
+      - name: CMake编译动态库
+        run: |
+          source ~/.bashrc
+          IOS_SDK="$HOME/osxcross/target/SDK/iPhoneOS17.0.sdk"
+          mkdir build && cd build
+          cmake \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="${IOS_SDK}" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            ..
+          make -j4
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: libIOSVISION
-        path: libIOSVISION.dylib
-        retention-days: 7
+      - name: 上传编译成品
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-lib-output
+          path: build/libIOSVISION.dylib
