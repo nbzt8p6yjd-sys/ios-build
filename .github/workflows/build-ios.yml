@@ -1,0 +1,46 @@
+name: Build iOS dylib
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt update
+          sudo apt install git cmake clang llvm make wget xz-utils
+
+      - name: 拉取osxcross交叉编译工具
+        run: |
+          git clone https://gitcode.com/gh_mirrors/os/osxcross.git ~/osxcross
+          cd ~/osxcross
+          mkdir tarballs
+          wget https://mirror.ghproxy.com/https://github.com/xybp888/iOS-SDKs/releases/download/iPhoneOS17.0.sdk/iPhoneOS17.0.sdk.tar.xz -O tarballs/iPhoneOS17.0.sdk.tar.xz
+          UNATTENDED=1 ./build.sh
+          echo "export PATH=$HOME/osxcross/target/bin:$PATH" >> ~/.bashrc
+          source ~/.bashrc
+
+      - name: CMake编译动态库
+        run: |
+          source ~/.bashrc
+          IOS_SDK="$HOME/osxcross/target/SDK/iPhoneOS17.0.sdk"
+          mkdir build && cd build
+          cmake \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="${IOS_SDK}" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            ..
+          make -j4
+
+      - name: 上传编译产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS成品库
+          path: build/libIOSVISION.dylib
