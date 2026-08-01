@@ -20,7 +20,8 @@ jobs:
             -dynamiclib -fobjc-arc -std=c++17 \
             -framework Foundation -framework GameKit \
             -install_name @rpath/libIOSVISION.dylib -Wl,-segalign,4000 \
-            hook_engine_ios_final.cpp libdobby.a -o libIOSVISION.dylib
+            -x objective-c++ hook_engine_ios_final.cpp libdobby.a \
+            -o libIOSVISION.dylib
 
       - name: Verify
         run: |
