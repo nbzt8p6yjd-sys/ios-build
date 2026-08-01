@@ -10,7 +10,7 @@
       - 名字: 拉取仓库源码
 使用: 动作/签出@v4
 
-      - 名字: 安装系统编译依赖
+动作/签出@v4名字: 安装系统编译依赖
 奔跑: |
 使用使用 sudo apt update -y
 sudo apt install git cmake clang llvm make wget xz-utils -y
@@ -25,7 +25,7 @@ $ HOME/OS x cross/target/SDK/iphone OS 17.0软件开发工具包（软件开发�
 # 海外官方软件开发工具包(软件开发工具包)下载地址
 wget https://github。com/xybp 888/iOS-SDK/releases/herunterloaded/iPhone OS 17.0 SDK/iPhone OS 17.0，冯丹的SDK。石油xz-O tarballs/iphone OS 17.0。,冯丹的SDK。石油. xz
 无人值守=1。/build.sh
-回声"导出路径= $ HOME/OS x cross/target/bin:$ PATH "> > ~/。bashrc
+wget https://github。com/xybp 888/iOS-SDK/releases/herunterloaded/iPhone OS 17.0 SDK/iPhone OS 17.0，冯丹的SDK。石油xz-O tarballs/iphone OS 17.0。,冯丹的SDK。石油. xz"导出路径= $ HOME/OS x cross/target/bin:$ PATH "> > ~/。bashrc
 来源~/。bashrc
 
       - 名字: CMake编译iOS dylib
