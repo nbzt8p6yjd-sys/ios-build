@@ -35,68 +35,14 @@ static NSString* extract_userid_from_file(NSString* path) {
     return nil;
 }
 
-// 从游戏已生成的文件中搜索真实 OfflineUserID
+// 从 pending_keyvalues_prod 读取真实 OfflineUserID
 static NSString* find_game_userid() {
     NSFileManager* fm = [NSFileManager defaultManager];
     NSString* home = NSHomeDirectory();
+    NSString* pendingPath = [home stringByAppendingPathComponent:@"Documents/DoNotStarveTogether/client_save/pending_keyvalues_prod"];
 
-    NSArray* searchDirs = @[
-        [home stringByAppendingPathComponent:@"Documents/DoNotStarveTogether/client_save"],
-        [home stringByAppendingPathComponent:@"Documents/DoNotStarveTogether"],
-        [home stringByAppendingPathComponent:@"Documents"],
-        [home stringByAppendingPathComponent:@"Library"],
-        [home stringByAppendingPathComponent:@"Library/Caches"],
-        [home stringByAppendingPathComponent:@"Library/Application Support"],
-    ];
-
-    for (NSString* dir in searchDirs) {
-        if (![fm fileExistsAtPath:dir]) continue;
-
-        // inventory_cache_prod
-        NSString* cachePath = [dir stringByAppendingPathComponent:@"inventory_cache_prod"];
-        if ([fm fileExistsAtPath:cachePath]) {
-            NSString* uid = extract_userid_from_file(cachePath);
-            if (uid) return uid;
-        }
-
-        // pending_keyvalues_prod
-        NSString* pendingPath = [dir stringByAppendingPathComponent:@"pending_keyvalues_prod"];
-        if ([fm fileExistsAtPath:pendingPath]) {
-            NSString* uid = extract_userid_from_file(pendingPath);
-            if (uid) return uid;
-        }
-
-        // cached_userid
-        NSString* cachedPath = [dir stringByAppendingPathComponent:@"cached_userid"];
-        if ([fm fileExistsAtPath:cachedPath]) {
-            NSData* data = [NSData dataWithContentsOfFile:cachedPath];
-            NSString* content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            content = [content stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if ([content length] > 0 && [content hasPrefix:@"E:"]) {
-                return content;
-            }
-        }
-
-        // 遍历子目录
-        NSArray* subdirs = [fm contentsOfDirectoryAtPath:dir error:nil];
-        for (NSString* subdir in subdirs) {
-            NSString* subPath = [dir stringByAppendingPathComponent:subdir];
-            BOOL isDir = NO;
-            if ([fm fileExistsAtPath:subPath isDirectory:&isDir] && isDir) {
-                NSString* subCache = [subPath stringByAppendingPathComponent:@"inventory_cache_prod"];
-                if ([fm fileExistsAtPath:subCache]) {
-                    NSString* uid = extract_userid_from_file(subCache);
-                    if (uid) return uid;
-                }
-                NSString* subPending = [subPath stringByAppendingPathComponent:@"pending_keyvalues_prod"];
-                if ([fm fileExistsAtPath:subPending]) {
-                    NSString* uid = extract_userid_from_file(subPending);
-                    if (uid) return uid;
-                }
-            }
-        }
-    }
-    return nil;
+    if (![fm fileExistsAtPath:pendingPath]) return nil;
+    return extract_userid_from_file(pendingPath);
 }
 
 // 处理缓存文件：有ID就替换，没ID就删除字段
@@ -139,6 +85,13 @@ static void iosvision_init() {
     // 2. 从游戏文件读取ID（游戏没有就是nil）
     NSString* userId = find_game_userid();
     LOGD("Game ID: %s", userId ? [userId UTF8String] : "(none)");
+
+    // 如果游戏还没生成 pending_keyvalues_prod，说明是第一次启动
+    // 不放文件，等下次启动游戏保存后再处理
+    if (!userId) {
+        LOGD("pending_keyvalues_prod not found, skip (first launch)");
+        return;
+    }
 
     // 3. 放文件到游戏存档目录
     NSString* home = NSHomeDirectory();
