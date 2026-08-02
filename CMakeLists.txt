@@ -1,6 +1,0 @@
-cmake_minimum_required(VERSION 3.16)
-project(iOSHook)
-set(CMAKE_CXX_STANDARD 17)
-add_library(IOSVISION SHARED hook_engine_ios_final.cpp)
-target_link_libraries(IOSVISION ${CMAKE_SOURCE_DIR}/libdobby.a)
-target_include_directories(IOSVISION PRIVATE ${CMAKE_SOURCE_DIR})
