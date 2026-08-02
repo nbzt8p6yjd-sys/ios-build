@@ -1,8 +1,10 @@
 /*
- * iOS Inventory Injector - 饥荒联机版
+ * iOS Inventory Injector - 饥荒联机版 v6.0
  *
- * 功能：把全皮肤库存缓存注入游戏 Documents 目录，自动替换本机ID
- * 不需要 Dobby，不需要 hook，不需要基址
+ * 最简方案：启动时执行一次，立即完成
+ * - 找到游戏ID → 替换
+ * - 没找到 → 删除字段（和游戏一致）
+ * 只执行一次，不影响游戏性能
  */
 
 #include <stdio.h>
@@ -16,26 +18,9 @@
 #define LOGD(fmt, ...) fprintf(stderr, "[IOSVISION] " fmt "\n", ##__VA_ARGS__)
 #define LOGE(fmt, ...) fprintf(stderr, "[IOSVISION ERROR] " fmt "\n", ##__VA_ARGS__)
 
-// 从设备 IDFV 生成 OfflineUserID
-// 饥荒格式：E: + UUID去掉横线（32位hex小写）
-static NSString* generate_device_userid() {
-    NSUUID* vendorId = [[UIDevice currentDevice] identifierForVendor];
-    if (vendorId) {
-        NSString* uuidStr = [vendorId UUIDString];
-        NSString* noHyphens = [uuidStr stringByReplacingOccurrencesOfString:@"-" withString:@""];
-        NSString* result = [NSString stringWithFormat:@"E:%@", [noHyphens lowercaseString]];
-        LOGD("Generated OfflineUserID from IDFV: %s", [result UTF8String]);
-        return result;
-    }
-    LOGE("identifierForVendor is nil!");
-    return nil;
-}
-
-// 从已有的缓存文件中提取本机 OfflineUserID
-static NSString* extract_local_userid(NSString* path) {
-    if (!path || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        return nil;
-    }
+// 从 JSON 文件中提取 OfflineUserID
+static NSString* extract_userid_from_file(NSString* path) {
+    if (!path || ![[NSFileManager defaultManager] fileExistsAtPath:path]) return nil;
     NSData* data = [NSData dataWithContentsOfFile:path];
     if (!data) return nil;
 
@@ -45,32 +30,51 @@ static NSString* extract_local_userid(NSString* path) {
 
     NSString* userid = [json objectForKey:@"OfflineUserID"];
     if (userid && [userid length] > 0) {
-        LOGD("Found existing OfflineUserID: %s", [userid UTF8String]);
         return userid;
     }
     return nil;
 }
 
-// 在游戏各目录搜索已有的缓存文件，提取本机ID
-static NSString* find_local_userid() {
+// 从游戏已生成的文件中搜索真实 OfflineUserID
+static NSString* find_game_userid() {
+    NSFileManager* fm = [NSFileManager defaultManager];
     NSString* home = NSHomeDirectory();
+
     NSArray* searchDirs = @[
+        [home stringByAppendingPathComponent:@"Documents/DoNotStarveTogether/client_save"],
+        [home stringByAppendingPathComponent:@"Documents/DoNotStarveTogether"],
         [home stringByAppendingPathComponent:@"Documents"],
         [home stringByAppendingPathComponent:@"Library"],
         [home stringByAppendingPathComponent:@"Library/Caches"],
         [home stringByAppendingPathComponent:@"Library/Application Support"],
     ];
 
-    NSFileManager* fm = [NSFileManager defaultManager];
-
     for (NSString* dir in searchDirs) {
         if (![fm fileExistsAtPath:dir]) continue;
 
-        // 直接检查
-        NSString* directPath = [dir stringByAppendingPathComponent:@"inventory_cache_prod"];
-        if ([fm fileExistsAtPath:directPath]) {
-            NSString* uid = extract_local_userid(directPath);
+        // inventory_cache_prod
+        NSString* cachePath = [dir stringByAppendingPathComponent:@"inventory_cache_prod"];
+        if ([fm fileExistsAtPath:cachePath]) {
+            NSString* uid = extract_userid_from_file(cachePath);
             if (uid) return uid;
+        }
+
+        // pending_keyvalues_prod
+        NSString* pendingPath = [dir stringByAppendingPathComponent:@"pending_keyvalues_prod"];
+        if ([fm fileExistsAtPath:pendingPath]) {
+            NSString* uid = extract_userid_from_file(pendingPath);
+            if (uid) return uid;
+        }
+
+        // cached_userid
+        NSString* cachedPath = [dir stringByAppendingPathComponent:@"cached_userid"];
+        if ([fm fileExistsAtPath:cachedPath]) {
+            NSData* data = [NSData dataWithContentsOfFile:cachedPath];
+            NSString* content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            content = [content stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if ([content length] > 0 && [content hasPrefix:@"E:"]) {
+                return content;
+            }
         }
 
         // 遍历子目录
@@ -79,9 +83,14 @@ static NSString* find_local_userid() {
             NSString* subPath = [dir stringByAppendingPathComponent:subdir];
             BOOL isDir = NO;
             if ([fm fileExistsAtPath:subPath isDirectory:&isDir] && isDir) {
-                NSString* cachePath = [subPath stringByAppendingPathComponent:@"inventory_cache_prod"];
-                if ([fm fileExistsAtPath:cachePath]) {
-                    NSString* uid = extract_local_userid(cachePath);
+                NSString* subCache = [subPath stringByAppendingPathComponent:@"inventory_cache_prod"];
+                if ([fm fileExistsAtPath:subCache]) {
+                    NSString* uid = extract_userid_from_file(subCache);
+                    if (uid) return uid;
+                }
+                NSString* subPending = [subPath stringByAppendingPathComponent:@"pending_keyvalues_prod"];
+                if ([fm fileExistsAtPath:subPending]) {
+                    NSString* uid = extract_userid_from_file(subPending);
                     if (uid) return uid;
                 }
             }
@@ -90,121 +99,110 @@ static NSString* find_local_userid() {
     return nil;
 }
 
-// 替换缓存文件中的 OfflineUserID 为本机ID
-static bool patch_cache_with_local_id(NSString* cachePath, NSString* localUserId) {
+// 处理缓存文件：有ID就替换，没ID就删除字段
+static bool patch_cache(NSString* cachePath, NSString* userId) {
     NSData* data = [NSData dataWithContentsOfFile:cachePath];
-    if (!data) {
-        LOGE("Failed to read cache for patching");
-        return false;
-    }
+    if (!data) return false;
 
     NSError* error = nil;
     NSMutableDictionary* json = [NSJSONSerialization JSONObjectWithData:data
                                                                 options:NSJSONReadingMutableContainers
                                                                   error:&error];
-    if (error || !json) {
-        LOGE("Failed to parse cache JSON: %s", error ? [[error localizedDescription] UTF8String] : "unknown");
-        return false;
-    }
+    if (error || !json) return false;
 
-    [json setObject:localUserId forKey:@"OfflineUserID"];
-    [json setObject:@"A" forKey:@"UserID"];
+    if (userId) {
+        [json setObject:userId forKey:@"OfflineUserID"];
+    } else {
+        [json removeObjectForKey:@"OfflineUserID"];
+    }
 
     NSData* patchedData = [NSJSONSerialization dataWithJSONObject:json options:0 error:&error];
-    if (error || !patchedData) {
-        LOGE("Failed to re-serialize patched cache");
-        return false;
-    }
+    if (error || !patchedData) return false;
 
-    bool ok = [patchedData writeToFile:cachePath atomically:YES];
-    LOGD("Patched cache with local ID: %s", ok ? "OK" : "FAILED");
-    return ok;
+    return [patchedData writeToFile:cachePath atomically:YES];
 }
 
-// ============================================================
-// 入口点：复制全皮肤缓存 + 替换本机ID + 删除签名
-// ============================================================
+// 入口：启动时执行一次
 __attribute__((constructor))
 static void iosvision_init() {
-    LOGD("========================================");
-    LOGD("IOSVISION Inventory Injector v3.0");
-    LOGD("========================================");
+    LOGD("IOSVISION v6.0 - One shot");
 
     NSFileManager* fm = [NSFileManager defaultManager];
-    NSString* docsDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-    NSString* cachePath = [docsDir stringByAppendingPathComponent:@"inventory_cache_prod"];
+
+    // 1. 从 bundle 读取全皮肤缓存
     NSString* bundlePath = [[NSBundle mainBundle] pathForResource:@"inventory_cache_prod" ofType:nil];
-
-    LOGD("Bundle path: %s", bundlePath ? [bundlePath UTF8String] : "(null)");
-    LOGD("Docs path: %s", [cachePath UTF8String]);
-
-    // Step 1: 获取本机 OfflineUserID
-    // 优先从 IDFV 生成（与游戏内部逻辑完全一致）
-    // 游戏通过 [[UIDevice currentDevice] identifierForVendor] 获取 IDFV
-    // 然后格式化为 E: + UUID去横线小写 作为 OfflineUserID
-    LOGD("--- Step 1: Get local OfflineUserID ---");
-    NSString* localUserId = generate_device_userid();
-    if (!localUserId) {
-        LOGD("IDFV unavailable, falling back to existing cache...");
-        localUserId = find_local_userid();
-    }
-    if (!localUserId) {
-        LOGE("FATAL: Could not determine local OfflineUserID!");
-        return;
-    }
-    LOGD("Using OfflineUserID: %s", [localUserId UTF8String]);
-
-    // Step 2: 复制全皮肤缓存到 Documents 目录
-    LOGD("--- Step 2: Copy inventory cache ---");
     if (!bundlePath || ![fm fileExistsAtPath:bundlePath]) {
-        LOGE("inventory_cache_prod not found in app bundle!");
-        LOGE("Make sure to include it in dontstarvetogether.app/");
+        LOGE("inventory_cache_prod not found in bundle!");
         return;
     }
 
-    [fm removeItemAtPath:cachePath error:nil];
-    NSError* error = nil;
-    [fm copyItemAtPath:bundlePath toPath:cachePath error:&error];
-    if (error) {
-        LOGE("Failed to copy cache: %s", [[error localizedDescription] UTF8String]);
-        return;
-    }
-    LOGD("Cache copied to Documents: OK");
+    // 2. 从游戏文件读取ID（游戏没有就是nil）
+    NSString* userId = find_game_userid();
+    LOGD("Game ID: %s", userId ? [userId UTF8String] : "(none)");
 
-    // Step 3: 替换本机ID
-    LOGD("--- Step 3: Patch with local ID ---");
-    patch_cache_with_local_id(cachePath, localUserId);
-
-    // Step 4: 删除签名文件绕过验证
-    LOGD("--- Step 4: Remove signature files ---");
-    NSArray* sigFiles = @[
-        [docsDir stringByAppendingPathComponent:@"inventory_cache_prod_sig"],
-        [docsDir stringByAppendingPathComponent:@"pending_keyvalues_prod_sig"],
+    // 3. 放文件到3个目录
+    NSString* home = NSHomeDirectory();
+    NSArray* targetDirs = @[
+        [home stringByAppendingPathComponent:@"Documents/DoNotStarveTogether/client_save"],
+        [home stringByAppendingPathComponent:@"Documents/DoNotStarveTogether"],
+        [home stringByAppendingPathComponent:@"Documents"],
     ];
-    for (NSString* sigPath in sigFiles) {
-        if ([fm fileExistsAtPath:sigPath]) {
-            [fm removeItemAtPath:sigPath error:nil];
-            LOGD("Removed: %s", [[sigPath lastPathComponent] UTF8String]);
+
+    for (NSString* dir in targetDirs) {
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        if (![fm fileExistsAtPath:dir]) continue;
+
+        NSString* cachePath = [dir stringByAppendingPathComponent:@"inventory_cache_prod"];
+
+        // 检查是否已存在且ID匹配，匹配则跳过
+        if ([fm fileExistsAtPath:cachePath]) {
+            NSString* existingId = extract_userid_from_file(cachePath);
+            BOOL idMatch = NO;
+            if (userId && existingId && [existingId isEqualToString:userId]) {
+                idMatch = YES;
+            } else if (!userId && !existingId) {
+                // 都没ID也算匹配
+                idMatch = YES;
+            }
+
+            if (idMatch) {
+                // 进一步检查文件是否包含全皮肤内容（Items数量）
+                // 只验证ID匹配即可，避免重复写入
+                LOGD("Skip (ID already matches): %s", [dir UTF8String]);
+
+                // 删除签名文件（签名存在会导致校验失败）
+                NSArray* sigFiles = @[
+                    [dir stringByAppendingPathComponent:@"inventory_cache_prod_sig"],
+                    [dir stringByAppendingPathComponent:@"pending_keyvalues_prod_sig"],
+                ];
+                for (NSString* sigPath in sigFiles) {
+                    if ([fm fileExistsAtPath:sigPath]) {
+                        [fm removeItemAtPath:sigPath error:nil];
+                    }
+                }
+                continue;
+            }
+        }
+
+        [fm removeItemAtPath:cachePath error:nil];
+        NSError* error = nil;
+        [fm copyItemAtPath:bundlePath toPath:cachePath error:&error];
+        if (error) continue;
+
+        // 有ID就替换，没ID就删除
+        patch_cache(cachePath, userId);
+
+        // 删除签名文件
+        NSArray* sigFiles = @[
+            [dir stringByAppendingPathComponent:@"inventory_cache_prod_sig"],
+            [dir stringByAppendingPathComponent:@"pending_keyvalues_prod_sig"],
+        ];
+        for (NSString* sigPath in sigFiles) {
+            if ([fm fileExistsAtPath:sigPath]) {
+                [fm removeItemAtPath:sigPath error:nil];
+            }
         }
     }
 
-    // Step 5: 验证
-    LOGD("--- Step 5: Verify ---");
-    NSData* finalData = [NSData dataWithContentsOfFile:cachePath];
-    if (finalData) {
-        NSString* content = [[NSString alloc] initWithData:finalData encoding:NSUTF8StringEncoding];
-        if (content) {
-            LOGD("Final cache size: %lu bytes", (unsigned long)[content length]);
-            if ([content containsString:@"WILSON"] && [content containsString:@"WENDY"]) {
-                LOGD("Skin data verified: OK");
-            }
-            if ([content containsString:localUserId]) {
-                LOGD("Local ID verified: OK");
-            }
-        }
-    }
-
-    LOGD("========================================");
-    LOGD("Injection complete!");
-    LOGD("========================================");
+    LOGD("Done.");
 }
