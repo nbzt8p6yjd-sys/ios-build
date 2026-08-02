@@ -1,3 +1,4 @@
+/*
  * iOS Inventory Injector - 饥荒联机版
  *
  * 功能：把全皮肤库存缓存注入游戏 Documents 目录，自动替换本机ID
@@ -138,11 +139,14 @@ static void iosvision_init() {
     LOGD("Docs path: %s", [cachePath UTF8String]);
 
     // Step 1: 获取本机 OfflineUserID
+    // 优先从 IDFV 生成（与游戏内部逻辑完全一致）
+    // 游戏通过 [[UIDevice currentDevice] identifierForVendor] 获取 IDFV
+    // 然后格式化为 E: + UUID去横线小写 作为 OfflineUserID
     LOGD("--- Step 1: Get local OfflineUserID ---");
-    NSString* localUserId = find_local_userid();
+    NSString* localUserId = generate_device_userid();
     if (!localUserId) {
-        LOGD("No existing cache, generating from device IDFV...");
-        localUserId = generate_device_userid();
+        LOGD("IDFV unavailable, falling back to existing cache...");
+        localUserId = find_local_userid();
     }
     if (!localUserId) {
         LOGE("FATAL: Could not determine local OfflineUserID!");
