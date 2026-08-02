@@ -1,9 +1,11 @@
 /*
- * iOS Inventory Injector - 饥荒联机版 v6.0
+ * iOS Inventory Injector - 饥荒联机版 v6.1
  *
- * 最简方案：启动时执行一次，立即完成
- * - 找到游戏ID → 替换
- * - 没找到 → 删除字段（和游戏一致）
+ * 启动时执行一次，完全跟随 pending_keyvalues_prod 的 OfflineID：
+ * - pending_keyvalues_prod 不存在 → 跳过（第一次启动）
+ * - OfflineID 有值 → inventory_cache_prod 的 OfflineUserID 设为该值
+ * - OfflineID 为空 → OfflineUserID 也设为空
+ * - ID已匹配 → 跳过不覆盖
  * 只执行一次，不影响游戏性能
  */
 
@@ -18,8 +20,8 @@
 #define LOGD(fmt, ...) fprintf(stderr, "[IOSVISION] " fmt "\n", ##__VA_ARGS__)
 #define LOGE(fmt, ...) fprintf(stderr, "[IOSVISION ERROR] " fmt "\n", ##__VA_ARGS__)
 
-// 从 JSON 文件中提取 OfflineUserID
-static NSString* extract_userid_from_file(NSString* path) {
+// 从 JSON 文件中提取指定字段
+static NSString* extract_field_from_file(NSString* path, NSString* field) {
     if (!path || ![[NSFileManager defaultManager] fileExistsAtPath:path]) return nil;
     NSData* data = [NSData dataWithContentsOfFile:path];
     if (!data) return nil;
@@ -28,24 +30,24 @@ static NSString* extract_userid_from_file(NSString* path) {
     NSDictionary* json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
     if (error || !json) return nil;
 
-    NSString* userid = [json objectForKey:@"OfflineUserID"];
-    if (userid && [userid length] > 0) {
-        return userid;
+    // 字段存在就返回（包括空字符串）
+    if ([json objectForKey:field]) {
+        return [json objectForKey:field];
     }
     return nil;
 }
 
-// 从 pending_keyvalues_prod 读取真实 OfflineUserID
+// 从 pending_keyvalues_prod 读取 OfflineID
 static NSString* find_game_userid() {
     NSFileManager* fm = [NSFileManager defaultManager];
     NSString* home = NSHomeDirectory();
     NSString* pendingPath = [home stringByAppendingPathComponent:@"Documents/DoNotStarveTogether/client_save/pending_keyvalues_prod"];
 
     if (![fm fileExistsAtPath:pendingPath]) return nil;
-    return extract_userid_from_file(pendingPath);
+    return extract_field_from_file(pendingPath, @"OfflineID");
 }
 
-// 处理缓存文件：有ID就替换，没ID就删除字段
+// 处理缓存文件：ID有值就替换，空值就设为空字符串
 static bool patch_cache(NSString* cachePath, NSString* userId) {
     NSData* data = [NSData dataWithContentsOfFile:cachePath];
     if (!data) return false;
@@ -56,11 +58,8 @@ static bool patch_cache(NSString* cachePath, NSString* userId) {
                                                                   error:&error];
     if (error || !json) return false;
 
-    if (userId) {
-        [json setObject:userId forKey:@"OfflineUserID"];
-    } else {
-        [json removeObjectForKey:@"OfflineUserID"];
-    }
+    // 和 pending_keyvalues_prod 一致：有值就设值，空就设空字符串
+    [json setObject:(userId ? userId : @"") forKey:@"OfflineUserID"];
 
     NSData* patchedData = [NSJSONSerialization dataWithJSONObject:json options:0 error:&error];
     if (error || !patchedData) return false;
@@ -71,7 +70,7 @@ static bool patch_cache(NSString* cachePath, NSString* userId) {
 // 入口：启动时执行一次
 __attribute__((constructor))
 static void iosvision_init() {
-    LOGD("IOSVISION v6.0 - One shot");
+    LOGD("IOSVISION v6.1 - One shot");
 
     NSFileManager* fm = [NSFileManager defaultManager];
 
@@ -82,11 +81,11 @@ static void iosvision_init() {
         return;
     }
 
-    // 2. 从游戏文件读取ID（游戏没有就是nil）
+    // 2. 从游戏文件读取ID（nil=文件不存在，@""=空字符串）
     NSString* userId = find_game_userid();
-    LOGD("Game ID: %s", userId ? [userId UTF8String] : "(none)");
+    LOGD("Game ID: %s", userId ? [userId UTF8String] : "(file not found)");
 
-    // 如果游戏还没生成 pending_keyvalues_prod，说明是第一次启动
+    // 如果 pending_keyvalues_prod 不存在，说明是第一次启动
     // 不放文件，等下次启动游戏保存后再处理
     if (!userId) {
         LOGD("pending_keyvalues_prod not found, skip (first launch)");
@@ -107,15 +106,9 @@ static void iosvision_init() {
 
     // 检查是否已存在且ID匹配，匹配则跳过
     if ([fm fileExistsAtPath:cachePath]) {
-        NSString* existingId = extract_userid_from_file(cachePath);
-        BOOL idMatch = NO;
-        if (userId && existingId && [existingId isEqualToString:userId]) {
-            idMatch = YES;
-        } else if (!userId && !existingId) {
-            idMatch = YES;
-        }
-
-        if (idMatch) {
+        NSString* existingId = extract_field_from_file(cachePath, @"OfflineUserID");
+        // 两者相等就跳过（包括都是空字符串的情况）
+        if (existingId && userId && [existingId isEqualToString:userId]) {
             LOGD("Skip (ID already matches)");
             // 删除签名文件
             NSArray* sigFiles = @[
@@ -140,7 +133,7 @@ static void iosvision_init() {
         return;
     }
 
-    // 有ID就替换，没ID就删除
+    // 和 pending_keyvalues_prod 的 OfflineID 保持一致
     patch_cache(cachePath, userId);
 
     // 删除签名文件
