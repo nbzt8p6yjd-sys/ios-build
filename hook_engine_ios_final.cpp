@@ -140,67 +140,64 @@ static void iosvision_init() {
     NSString* userId = find_game_userid();
     LOGD("Game ID: %s", userId ? [userId UTF8String] : "(none)");
 
-    // 3. 放文件到3个目录
+    // 3. 放文件到游戏存档目录
     NSString* home = NSHomeDirectory();
-    NSArray* targetDirs = @[
-        [home stringByAppendingPathComponent:@"Documents/DoNotStarveTogether/client_save"],
-        [home stringByAppendingPathComponent:@"Documents/DoNotStarveTogether"],
-        [home stringByAppendingPathComponent:@"Documents"],
-    ];
+    NSString* targetDir = [home stringByAppendingPathComponent:@"Documents/DoNotStarveTogether/client_save"];
 
-    for (NSString* dir in targetDirs) {
-        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        if (![fm fileExistsAtPath:dir]) continue;
+    [fm createDirectoryAtPath:targetDir withIntermediateDirectories:YES attributes:nil error:nil];
+    if (![fm fileExistsAtPath:targetDir]) {
+        LOGE("Cannot create target dir!");
+        return;
+    }
 
-        NSString* cachePath = [dir stringByAppendingPathComponent:@"inventory_cache_prod"];
+    NSString* cachePath = [targetDir stringByAppendingPathComponent:@"inventory_cache_prod"];
 
-        // 检查是否已存在且ID匹配，匹配则跳过
-        if ([fm fileExistsAtPath:cachePath]) {
-            NSString* existingId = extract_userid_from_file(cachePath);
-            BOOL idMatch = NO;
-            if (userId && existingId && [existingId isEqualToString:userId]) {
-                idMatch = YES;
-            } else if (!userId && !existingId) {
-                // 都没ID也算匹配
-                idMatch = YES;
-            }
-
-            if (idMatch) {
-                // 进一步检查文件是否包含全皮肤内容（Items数量）
-                // 只验证ID匹配即可，避免重复写入
-                LOGD("Skip (ID already matches): %s", [dir UTF8String]);
-
-                // 删除签名文件（签名存在会导致校验失败）
-                NSArray* sigFiles = @[
-                    [dir stringByAppendingPathComponent:@"inventory_cache_prod_sig"],
-                    [dir stringByAppendingPathComponent:@"pending_keyvalues_prod_sig"],
-                ];
-                for (NSString* sigPath in sigFiles) {
-                    if ([fm fileExistsAtPath:sigPath]) {
-                        [fm removeItemAtPath:sigPath error:nil];
-                    }
-                }
-                continue;
-            }
+    // 检查是否已存在且ID匹配，匹配则跳过
+    if ([fm fileExistsAtPath:cachePath]) {
+        NSString* existingId = extract_userid_from_file(cachePath);
+        BOOL idMatch = NO;
+        if (userId && existingId && [existingId isEqualToString:userId]) {
+            idMatch = YES;
+        } else if (!userId && !existingId) {
+            idMatch = YES;
         }
 
-        [fm removeItemAtPath:cachePath error:nil];
-        NSError* error = nil;
-        [fm copyItemAtPath:bundlePath toPath:cachePath error:&error];
-        if (error) continue;
-
-        // 有ID就替换，没ID就删除
-        patch_cache(cachePath, userId);
-
-        // 删除签名文件
-        NSArray* sigFiles = @[
-            [dir stringByAppendingPathComponent:@"inventory_cache_prod_sig"],
-            [dir stringByAppendingPathComponent:@"pending_keyvalues_prod_sig"],
-        ];
-        for (NSString* sigPath in sigFiles) {
-            if ([fm fileExistsAtPath:sigPath]) {
-                [fm removeItemAtPath:sigPath error:nil];
+        if (idMatch) {
+            LOGD("Skip (ID already matches)");
+            // 删除签名文件
+            NSArray* sigFiles = @[
+                [targetDir stringByAppendingPathComponent:@"inventory_cache_prod_sig"],
+                [targetDir stringByAppendingPathComponent:@"pending_keyvalues_prod_sig"],
+            ];
+            for (NSString* sigPath in sigFiles) {
+                if ([fm fileExistsAtPath:sigPath]) {
+                    [fm removeItemAtPath:sigPath error:nil];
+                }
             }
+            LOGD("Done.");
+            return;
+        }
+    }
+
+    [fm removeItemAtPath:cachePath error:nil];
+    NSError* error = nil;
+    [fm copyItemAtPath:bundlePath toPath:cachePath error:&error];
+    if (error) {
+        LOGE("Copy failed: %s", [[error localizedDescription] UTF8String]);
+        return;
+    }
+
+    // 有ID就替换，没ID就删除
+    patch_cache(cachePath, userId);
+
+    // 删除签名文件
+    NSArray* sigFiles = @[
+        [targetDir stringByAppendingPathComponent:@"inventory_cache_prod_sig"],
+        [targetDir stringByAppendingPathComponent:@"pending_keyvalues_prod_sig"],
+    ];
+    for (NSString* sigPath in sigFiles) {
+        if ([fm fileExistsAtPath:sigPath]) {
+            [fm removeItemAtPath:sigPath error:nil];
         }
     }
 
