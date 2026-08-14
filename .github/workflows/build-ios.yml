@@ -22,8 +22,13 @@ jobs:
             -framework Foundation -framework UIKit \
             -install_name @rpath/libIOSVISION.dylib \
             hook_engine_ios_final.mm \
-            libdobby.a \
             -o libIOSVISION.dylib
+
+      - name: Ad-hoc codesign (avoid unsigned dylib rejected by dyld)
+        run: |
+          codesign --force --sign - libIOSVISION.dylib || true
+          # 确认签名存在
+          codesign -dvv libIOSVISION.dylib 2>&1 | head -20 || true
 
       - name: Verify
         run: |
