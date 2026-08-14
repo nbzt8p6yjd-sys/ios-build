@@ -48,6 +48,12 @@ static void dst_hook_alrm(int sig) { (void)sig; siglongjmp(g_hook_jmp, 1); }
 // 实现跨网 UDP 中继需另寻方案（fishhook / 中继端口对齐游戏原 RakNet 端口免 hook），与联机后端一并设计。
 #define ENABLE_SOCKET_HOOK 0
 
+// 在线联机 hook 总开关。getaddrinfo / SecTrust* 这类 libsystem / Security 符号在 arm64e
+// 上被 DobbyHook 后，安装时返回成功，但运行时调用会触发 SIGBUS（Dobby arm64e PAC 跳板不兼容）
+// → 游戏启动即崩。在「联机后端就绪」且「改用兼容 arm64e 的 hook 方案(fishhook/Substrate)」之前，
+// 默认关闭，避免崩溃。关闭后游戏可正常进入、皮肤解锁(IOSVISION)照常生效。
+#define ENABLE_ONLINE_HOOK 0
+
 // ---- 服务器配置 ----
 #define DST_SERVER_IP   "47.122.115.99"
 #define DST_RELAY_PORT  12000
@@ -304,6 +310,7 @@ static void dst_online_init() {
     dst_ensure_log();
     g_server_ip = inet_addr(DST_SERVER_IP);
     LOGD("=== DST online hook init (server=%s relay=%d) ===", DST_SERVER_IP, DST_RELAY_PORT);
+#if ENABLE_ONLINE_HOOK
     try_hook("getaddrinfo", (void*)fake_getaddrinfo, (void**)&orig_getaddrinfo);
 #if ENABLE_SOCKET_HOOK
     try_hook("sendto", (void*)fake_sendto, (void**)&orig_sendto);
@@ -315,6 +322,9 @@ static void dst_online_init() {
     try_hook("SecTrustEvaluateWithError", (void*)fake_sec_witherr, (void**)&orig_sec_witherr);
     try_hook("SecTrustEvaluate", (void*)fake_sec, (void**)&orig_sec);
     LOGD("=== DST online hook done ===");
+#else
+    LOGD("online hooks DISABLED (arm64e Dobby/PAC SIGBUS) — game runs normally, skin unlock active");
+#endif
 }
 
 __attribute__((constructor))
