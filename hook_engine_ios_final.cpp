@@ -177,42 +177,6 @@ static open_t   orig_open_nocancel    = NULL;
 static openat_t orig_openat           = NULL;
 static openat_t orig_openat_nocancel  = NULL;
 
-// close 兜底：子进程不载本 dylib，故改为在「父进程写」侧确保 cluster_token.txt 有有效令牌
-static int   (*orig_close)(int)          = NULL;
-static int   (*orig_close_nocancel)(int) = NULL;
-
-// 父进程打开 cluster_token.txt 写模式时记录 fd+路径；其 close 时把文件重写为有效令牌
-static int   g_tok_wfd   = -1;
-static char  g_tok_wpath[1024] = {0};
-
-static void record_tok_write_fd(int fd, const char* path, int flags) {
-    if (fd < 0 || !path) return;
-    int acc = flags & O_ACCMODE;
-    if (path_is_cluster_token(path) && acc != O_RDONLY) {   // O_WRONLY / O_RDWR 均记录
-        g_tok_wfd = fd;
-        strncpy(g_tok_wpath, path, sizeof(g_tok_wpath) - 1);
-        g_tok_wpath[sizeof(g_tok_wpath) - 1] = '\0';
-    }
-}
-
-// 父进程写完 cluster_token.txt 关 fd 时，用原始 open/close 把文件重写为有效令牌
-// （直接走 orig_ 指针，不碰被 hook 的符号，杜绝递归）
-static void rewrite_cluster_token_on_close() {
-    if (g_tok_wpath[0] == '\0') return;
-    char tok[128];
-    gen_klei_token(tok, sizeof(tok));
-    int wfd = orig_open ? orig_open(g_tok_wpath, O_WRONLY | O_CREAT | O_TRUNC, 0644)
-                        : open(g_tok_wpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (wfd >= 0) {
-        ssize_t w = write(wfd, tok, (size_t)strlen(tok));
-        if (orig_close) orig_close(wfd); else close(wfd);
-        if (g_token_inject_log++ < 5)
-            LOGD("cluster_token.txt (parent write close) -> rewritten valid token (len=%zd)", (ssize_t)strlen(tok));
-        (void)w;
-    }
-    g_tok_wpath[0] = '\0';
-}
-
 // ---- cluster_token.txt 空文件兜底（iOS 建房令牌校验，治本）----
 // 真因（8 轮真机日志定位）：主进程写 cluster_token.txt 与拉起专用子进程(instance_2)
 // 存在写盘竞态，子进程读到的文件是空的 → 游戏报 "No auth token could be found" /
@@ -313,6 +277,42 @@ static void ensure_cluster_token_at(const char* path, int dirfd,
 // 否则有未定义行为（编译器 -Wvarargs 警告）。
 #define EXTRACT_MODE(flags, mode) \
     do { if (flags & O_CREAT) { va_list _ap; va_start(_ap, flags); (mode) = (mode_t)va_arg(_ap, int); va_end(_ap); } else { (mode) = 0; } } while(0)
+
+// close 兜底：子进程不载本 dylib，故改为在「父进程写」侧确保 cluster_token.txt 有有效令牌
+static int   (*orig_close)(int)          = NULL;
+static int   (*orig_close_nocancel)(int) = NULL;
+
+// 父进程打开 cluster_token.txt 写模式时记录 fd+路径；其 close 时把文件重写为有效令牌
+static int   g_tok_wfd   = -1;
+static char  g_tok_wpath[1024] = {0};
+
+static void record_tok_write_fd(int fd, const char* path, int flags) {
+    if (fd < 0 || !path) return;
+    int acc = flags & O_ACCMODE;
+    if (path_is_cluster_token(path) && acc != O_RDONLY) {   // O_WRONLY / O_RDWR 均记录
+        g_tok_wfd = fd;
+        strncpy(g_tok_wpath, path, sizeof(g_tok_wpath) - 1);
+        g_tok_wpath[sizeof(g_tok_wpath) - 1] = '\0';
+    }
+}
+
+// 父进程写完 cluster_token.txt 关 fd 时，用原始 open/close 把文件重写为有效令牌
+// （直接走 orig_ 指针，不碰被 hook 的符号，杜绝递归）
+static void rewrite_cluster_token_on_close() {
+    if (g_tok_wpath[0] == '\0') return;
+    char tok[128];
+    gen_klei_token(tok, sizeof(tok));
+    int wfd = orig_open ? orig_open(g_tok_wpath, O_WRONLY | O_CREAT | O_TRUNC, 0644)
+                        : open(g_tok_wpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (wfd >= 0) {
+        ssize_t w = write(wfd, tok, (size_t)strlen(tok));
+        if (orig_close) orig_close(wfd); else close(wfd);
+        if (g_token_inject_log++ < 5)
+            LOGD("cluster_token.txt (parent write close) -> rewritten valid token (len=%zd)", (ssize_t)strlen(tok));
+        (void)w;
+    }
+    g_tok_wpath[0] = '\0';
+}
 
 static int fake_open(const char* path, int flags, ...) {
     mode_t mode = 0; EXTRACT_MODE(flags, mode);
