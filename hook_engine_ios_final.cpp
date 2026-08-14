@@ -177,6 +177,42 @@ static open_t   orig_open_nocancel    = NULL;
 static openat_t orig_openat           = NULL;
 static openat_t orig_openat_nocancel  = NULL;
 
+// close 兜底：子进程不载本 dylib，故改为在「父进程写」侧确保 cluster_token.txt 有有效令牌
+static int   (*orig_close)(int)          = NULL;
+static int   (*orig_close_nocancel)(int) = NULL;
+
+// 父进程打开 cluster_token.txt 写模式时记录 fd+路径；其 close 时把文件重写为有效令牌
+static int   g_tok_wfd   = -1;
+static char  g_tok_wpath[1024] = {0};
+
+static void record_tok_write_fd(int fd, const char* path, int flags) {
+    if (fd < 0 || !path) return;
+    int acc = flags & O_ACCMODE;
+    if (path_is_cluster_token(path) && acc != O_RDONLY) {   // O_WRONLY / O_RDWR 均记录
+        g_tok_wfd = fd;
+        strncpy(g_tok_wpath, path, sizeof(g_tok_wpath) - 1);
+        g_tok_wpath[sizeof(g_tok_wpath) - 1] = '\0';
+    }
+}
+
+// 父进程写完 cluster_token.txt 关 fd 时，用原始 open/close 把文件重写为有效令牌
+// （直接走 orig_ 指针，不碰被 hook 的符号，杜绝递归）
+static void rewrite_cluster_token_on_close() {
+    if (g_tok_wpath[0] == '\0') return;
+    char tok[128];
+    gen_klei_token(tok, sizeof(tok));
+    int wfd = orig_open ? orig_open(g_tok_wpath, O_WRONLY | O_CREAT | O_TRUNC, 0644)
+                        : open(g_tok_wpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (wfd >= 0) {
+        ssize_t w = write(wfd, tok, (size_t)strlen(tok));
+        if (orig_close) orig_close(wfd); else close(wfd);
+        if (g_token_inject_log++ < 5)
+            LOGD("cluster_token.txt (parent write close) -> rewritten valid token (len=%zd)", (ssize_t)strlen(tok));
+        (void)w;
+    }
+    g_tok_wpath[0] = '\0';
+}
+
 // ---- cluster_token.txt 空文件兜底（iOS 建房令牌校验，治本）----
 // 真因（8 轮真机日志定位）：主进程写 cluster_token.txt 与拉起专用子进程(instance_2)
 // 存在写盘竞态，子进程读到的文件是空的 → 游戏报 "No auth token could be found" /
@@ -285,7 +321,9 @@ static int fake_open(const char* path, int flags, ...) {
         ensure_cluster_token(path, orig_open);
         g_open_reent = 0;
     }
-    return orig_open ? orig_open(path, flags, mode) : open(path, flags, mode);
+    int fd = orig_open ? orig_open(path, flags, mode) : open(path, flags, mode);
+    record_tok_write_fd(fd, path, flags);
+    return fd;
 }
 
 static int fake_open_nocancel(const char* path, int flags, ...) {
@@ -296,7 +334,9 @@ static int fake_open_nocancel(const char* path, int flags, ...) {
         ensure_cluster_token(path, real);
         g_open_reent = 0;
     }
-    return real(path, flags, mode);
+    int fd = real(path, flags, mode);
+    record_tok_write_fd(fd, path, flags);
+    return fd;
 }
 
 static int fake_openat(int dirfd, const char* path, int flags, ...) {
@@ -306,8 +346,10 @@ static int fake_openat(int dirfd, const char* path, int flags, ...) {
         ensure_cluster_token_at(path, dirfd, orig_openat);
         g_open_reent = 0;
     }
-    return orig_openat ? orig_openat(dirfd, path, flags, mode)
-                       : openat(dirfd, path, flags, mode);
+    int fd = orig_openat ? orig_openat(dirfd, path, flags, mode)
+                         : openat(dirfd, path, flags, mode);
+    record_tok_write_fd(fd, path, flags);
+    return fd;
 }
 
 static int fake_openat_nocancel(int dirfd, const char* path, int flags, ...) {
@@ -318,7 +360,25 @@ static int fake_openat_nocancel(int dirfd, const char* path, int flags, ...) {
         ensure_cluster_token_at(path, dirfd, real);
         g_open_reent = 0;
     }
-    return real(dirfd, path, flags, mode);
+    int fd = real(dirfd, path, flags, mode);
+    record_tok_write_fd(fd, path, flags);
+    return fd;
+}
+
+static int fake_close(int fd) {
+    if (fd >= 0 && fd == g_tok_wfd) {
+        g_tok_wfd = -1;
+        rewrite_cluster_token_on_close();
+    }
+    return orig_close ? orig_close(fd) : close(fd);
+}
+
+static int fake_close_nocancel(int fd) {
+    if (fd >= 0 && fd == g_tok_wfd) {
+        g_tok_wfd = -1;
+        rewrite_cluster_token_on_close();
+    }
+    return orig_close_nocancel ? orig_close_nocancel(fd) : close(fd);
 }
 
 // 取 socket 类型（SOCK_DGRAM / SOCK_STREAM），用于区分 UDP 与 TCP
@@ -410,6 +470,8 @@ static void dst_online_init() {
         {"open$NOCANCEL",   (void*)fake_open_nocancel,   (void**)&orig_open_nocancel},
         {"openat",          (void*)fake_openat,          (void**)&orig_openat},
         {"openat$NOCANCEL", (void*)fake_openat_nocancel, (void**)&orig_openat_nocancel},
+        {"close",           (void*)fake_close,           (void**)&orig_close},
+        {"close$NOCANCEL",  (void*)fake_close_nocancel,  (void**)&orig_close_nocancel},
     };
     int rc = rebind_symbols(rebinds, sizeof(rebinds)/sizeof(rebinds[0]));
     LOGD("rebind_symbols rc=%d (0=OK)", rc);
