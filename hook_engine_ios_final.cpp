@@ -117,15 +117,18 @@ static int fake_x509_verify(void* ctx) {
 }
 
 // 2c) 系统 Security.framework（兜底，对 libcurl 通常不生效，但无害）
-typedef OSStatus (*sec_trust_witherr_t)(SecTrustRef, bool*);
-static sec_trust_witherr_t orig_sec_witherr = NULL;
-static OSStatus fake_sec_witherr(SecTrustRef trust, bool* result) {
+// 注意：新版 SDK 中 SecTrustRef 是 Obj-C 对象类型，这里用 void* 避免 ARC/类型冲突。
+typedef OSStatus (*dst_sec_witherr_t)(void*, bool*);
+static dst_sec_witherr_t orig_sec_witherr = NULL;
+static OSStatus fake_sec_witherr(void* trust, bool* result) {
+    (void)trust;
     if (result) *result = true;
     return errSecSuccess;
 }
-typedef OSStatus (*sec_trust_t)(SecTrustRef, SecTrustResultType*);
-static sec_trust_t orig_sec = NULL;
-static OSStatus fake_sec(SecTrustRef trust, SecTrustResultType* result) {
+typedef OSStatus (*dst_sec_trust_t)(void*, SecTrustResultType*);
+static dst_sec_trust_t orig_sec = NULL;
+static OSStatus fake_sec(void* trust, SecTrustResultType* result) {
+    (void)trust;
     if (result) *result = kSecTrustResultProceed;
     return errSecSuccess;
 }
