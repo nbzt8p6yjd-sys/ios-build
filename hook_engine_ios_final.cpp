@@ -33,6 +33,8 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include <Foundation/Foundation.h>
 #include <UIKit/UIKit.h>
@@ -167,6 +169,133 @@ static connect_t orig_connect = NULL;
 static sendto_t orig_sendto   = NULL;
 static bind_t   orig_bind     = NULL;
 
+// ---- cluster_token.txt 空文件兜底（iOS 建房令牌校验）----
+typedef int (*open_t)(const char*, int, ...);
+typedef int (*openat_t)(int, const char*, int, ...);
+static open_t   orig_open             = NULL;
+static open_t   orig_open_nocancel    = NULL;
+static openat_t orig_openat           = NULL;
+static openat_t orig_openat_nocancel  = NULL;
+
+// ---- cluster_token.txt 空文件兜底（iOS 建房令牌校验，治本）----
+// 真因（8 轮真机日志定位）：主进程写 cluster_token.txt 与拉起专用子进程(instance_2)
+// 存在写盘竞态，子进程读到的文件是空的 → 游戏报 "No auth token could be found" /
+// "Your Server Will Not Start !!!!". 服务端响应格式已验证正确，此问题纯属客户端原生层。
+// 本 dylib 经 LC_LOAD_DYLIB 注入主二进制 dontstarvetogether；专用子进程是同一二进制
+// 再 exec，故本 hook 同时覆盖子进程。拦「读取 cluster_token.txt」：若文件空/不存在，
+// 先注入一个有效 pds-g<base64>= 令牌，再返回已填好内容的 fd，子进程即可拿到令牌走通建房。
+static __thread int g_open_reent = 0;
+static int g_token_inject_log = 0;
+
+static int path_is_cluster_token(const char* path) {
+    if (!path) return 0;
+    return strstr(path, "cluster_token.txt") != NULL;
+}
+
+// 判定这是「读取」打开（需要注入兜底）：纯写(O_WRONLY)与重建截断(O_RDWR|O_TRUNC)排除，
+// 避免误改游戏自身的写盘逻辑。覆盖 O_RDONLY 与 O_RDWR(非截断) 两类读场景。
+static int open_is_read(int flags) {
+    int acc = flags & O_ACCMODE;
+    if (acc == O_RDONLY) return 1;
+    if (acc == O_RDWR && !(flags & O_TRUNC)) return 1;
+    return 0;
+}
+
+// 生成 pds-g<base64>= 令牌（与 server/api/main.py 的 klei_token() 同形态）
+static void gen_klei_token(char* buf, size_t buflen) {
+    unsigned char raw[32];
+    arc4random_buf(raw, sizeof(raw));
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char enc[48]; int oi = 0;
+    for (int i = 0; i + 3 <= 32; i += 3) {
+        unsigned n = (raw[i] << 16) | (raw[i+1] << 8) | raw[i+2];
+        enc[oi++] = b64[(n >> 18) & 0x3F];
+        enc[oi++] = b64[(n >> 12) & 0x3F];
+        enc[oi++] = b64[(n >> 6)  & 0x3F];
+        enc[oi++] = b64[n & 0x3F];
+    }
+    // 末尾剩 2 字节 (raw[30], raw[31]) -> 3 个 base64 + 1 个 '='
+    unsigned tail = (raw[30] << 16) | (raw[31] << 8);
+    enc[oi++] = b64[(tail >> 18) & 0x3F];
+    enc[oi++] = b64[(tail >> 12) & 0x3F];
+    enc[oi++] = b64[(tail >> 6)  & 0x3F];
+    enc[oi++] = '=';
+    enc[oi] = '\0';                         // 共 44 字符，末尾 '='
+    snprintf(buf, buflen, "pds-g%s", enc);
+}
+
+// 用「原始 open 指针」做空文件检测 + 注入（直接走原始指针，不碰被 hook 的符号，杜绝递归）
+static void ensure_cluster_token(const char* path,
+                                 int (*real_open)(const char*, int, ...)) {
+    if (!real_open) return;
+    int fd0 = real_open(path, O_RDONLY);
+    int empty = 1;
+    if (fd0 >= 0) {
+        char c; ssize_t n = read(fd0, &c, 1);
+        close(fd0);
+        empty = (n <= 0);
+    }
+    if (!empty) return;                     // 文件已有内容 → 不干预
+    char tok[128];
+    gen_klei_token(tok, sizeof(tok));
+    int wfd = real_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (wfd >= 0) {
+        ssize_t w = write(wfd, tok, (size_t)strlen(tok));
+        close(wfd);
+        if (g_token_inject_log++ < 5)
+            LOGD("cluster_token.txt was empty/missing -> injected valid token (len=%zd)", (ssize_t)strlen(tok));
+        (void)w;
+    }
+}
+
+static int fake_open(const char* path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
+    if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
+        g_open_reent = 1;
+        ensure_cluster_token(path, orig_open);
+        g_open_reent = 0;
+    }
+    return orig_open ? orig_open(path, flags, mode) : open(path, flags, mode);
+}
+
+static int fake_open_nocancel(const char* path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
+    int (*real)(const char*, int, ...) = orig_open_nocancel ? orig_open_nocancel : orig_open;
+    if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
+        g_open_reent = 1;
+        ensure_cluster_token(path, real);
+        g_open_reent = 0;
+    }
+    return real(path, flags, mode);
+}
+
+static int fake_openat(int dirfd, const char* path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
+    if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
+        g_open_reent = 1;
+        ensure_cluster_token(path, orig_openat);
+        g_open_reent = 0;
+    }
+    return orig_openat ? orig_openat(dirfd, path, flags, mode)
+                       : openat(dirfd, path, flags, mode);
+}
+
+static int fake_openat_nocancel(int dirfd, const char* path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
+    int (*real)(const char*, int, ...) = orig_openat_nocancel ? orig_openat_nocancel : orig_openat;
+    if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
+        g_open_reent = 1;
+        ensure_cluster_token(path, real);
+        g_open_reent = 0;
+    }
+    return real(dirfd, path, flags, mode);
+}
+
 // 取 socket 类型（SOCK_DGRAM / SOCK_STREAM），用于区分 UDP 与 TCP
 static int sock_type(int fd) {
     int type = 0; socklen_t tl = sizeof(type);
@@ -252,6 +381,10 @@ static void dst_online_init() {
         {"connect", (void*)fake_connect, (void**)&orig_connect},
         {"sendto",  (void*)fake_sendto,  (void**)&orig_sendto},
         {"bind",    (void*)fake_bind,    (void**)&orig_bind},
+        {"open",            (void*)fake_open,            (void**)&orig_open},
+        {"open$NOCANCEL",   (void*)fake_open_nocancel,   (void**)&orig_open_nocancel},
+        {"openat",          (void*)fake_openat,          (void**)&orig_openat},
+        {"openat$NOCANCEL", (void*)fake_openat_nocancel, (void**)&orig_openat_nocancel},
     };
     int rc = rebind_symbols(rebinds, sizeof(rebinds)/sizeof(rebinds[0]));
     LOGD("rebind_symbols rc=%d (0=OK)", rc);
