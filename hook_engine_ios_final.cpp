@@ -249,9 +249,37 @@ static void ensure_cluster_token(const char* path,
     }
 }
 
+// openat 变体（多一个 dirfd 参数，函数指针签名不同，不能与上面复用）
+static void ensure_cluster_token_at(const char* path, int dirfd,
+                                    int (*real_openat)(int, const char*, int, ...)) {
+    if (!real_openat) return;
+    int fd0 = real_openat(dirfd, path, O_RDONLY);
+    int empty = 1;
+    if (fd0 >= 0) {
+        char c; ssize_t n = read(fd0, &c, 1);
+        close(fd0);
+        empty = (n <= 0);
+    }
+    if (!empty) return;
+    char tok[128];
+    gen_klei_token(tok, sizeof(tok));
+    int wfd = real_openat(dirfd, path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (wfd >= 0) {
+        ssize_t w = write(wfd, tok, (size_t)strlen(tok));
+        close(wfd);
+        if (g_token_inject_log++ < 5)
+            LOGD("cluster_token.txt(AT) empty/missing -> injected valid token");
+        (void)w;
+    }
+}
+
+// 从可变参数里取 mode（O_CREAT 时才有）：mode_t 是可提升类型，va_arg 必须按 int 取再转回，
+// 否则有未定义行为（编译器 -Wvarargs 警告）。
+#define EXTRACT_MODE(flags, mode) \
+    do { if (flags & O_CREAT) { va_list _ap; va_start(_ap, flags); (mode) = (mode_t)va_arg(_ap, int); va_end(_ap); } else { (mode) = 0; } } while(0)
+
 static int fake_open(const char* path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
+    mode_t mode = 0; EXTRACT_MODE(flags, mode);
     if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
         g_open_reent = 1;
         ensure_cluster_token(path, orig_open);
@@ -261,9 +289,8 @@ static int fake_open(const char* path, int flags, ...) {
 }
 
 static int fake_open_nocancel(const char* path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
-    int (*real)(const char*, int, ...) = orig_open_nocancel ? orig_open_nocancel : orig_open;
+    mode_t mode = 0; EXTRACT_MODE(flags, mode);
+    open_t real = orig_open_nocancel ? orig_open_nocancel : orig_open;
     if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
         g_open_reent = 1;
         ensure_cluster_token(path, real);
@@ -273,11 +300,10 @@ static int fake_open_nocancel(const char* path, int flags, ...) {
 }
 
 static int fake_openat(int dirfd, const char* path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
+    mode_t mode = 0; EXTRACT_MODE(flags, mode);
     if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
         g_open_reent = 1;
-        ensure_cluster_token(path, orig_openat);
+        ensure_cluster_token_at(path, dirfd, orig_openat);
         g_open_reent = 0;
     }
     return orig_openat ? orig_openat(dirfd, path, flags, mode)
@@ -285,12 +311,11 @@ static int fake_openat(int dirfd, const char* path, int flags, ...) {
 }
 
 static int fake_openat_nocancel(int dirfd, const char* path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
-    int (*real)(const char*, int, ...) = orig_openat_nocancel ? orig_openat_nocancel : orig_openat;
+    mode_t mode = 0; EXTRACT_MODE(flags, mode);
+    openat_t real = orig_openat_nocancel ? orig_openat_nocancel : orig_openat;
     if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
         g_open_reent = 1;
-        ensure_cluster_token(path, real);
+        ensure_cluster_token_at(path, dirfd, real);
         g_open_reent = 0;
     }
     return real(dirfd, path, flags, mode);
