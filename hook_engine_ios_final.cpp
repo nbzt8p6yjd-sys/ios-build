@@ -132,6 +132,28 @@ static int is_relay(uint32_t ip_host, int port) {
     return ip_host == g_relay_ip && port == DST_RELAY_PORT;
 }
 
+// ---- 诊断日志（仅建房/联机排错用，限行数避免刷屏）----
+// 建房失败排查核心：记录每次 UDP bind/connect/sendto 的目的地址/地址族/是否被重定向，
+// 重点看清分片对等体(instance_2 的服务端实例)启动时到底在连/发往哪个地址
+// （127.0.0.1 回环 / 设备真实 IP / IPv6?），从而定位 SOCKET_FAILED_TEST_SEND 成因。
+static int g_diag_total = 0;   // 回环/绑定等关键信息行数（宽松）
+static int g_diag_ext   = 0;   // 外部(重定到中继)流量采样行数（限量，保预算）
+static void dst_diag(const char* tag, int fd, int fam, const struct sockaddr* addr, int flag) {
+    // flag 含义随 tag：sendto/connect = 是否被重定到中继；bind = 是否 INADDR_ANY
+    int is_ext = (fam == AF_INET && flag);  // 被重定到中继 = 外部流量，限量采样
+    if (is_ext) { if (g_diag_ext++ > 150) return; }
+    else        { if (g_diag_total++ > 2000) return; }
+    char ip[64] = "?"; int port = 0;
+    if (fam == AF_INET && addr) {
+        const struct sockaddr_in* s = (const struct sockaddr_in*)(const void*)addr;
+        inet_ntop(AF_INET, &s->sin_addr, ip, sizeof(ip));
+        port = ntohs(s->sin_port);
+    } else if (fam == AF_INET6) {
+        snprintf(ip, sizeof(ip), "[v6]");
+    }
+    LOGD("[DIAG] %s fd=%d fam=%d %s:%d flag=%d", tag, fd, fam, ip, port, flag);
+}
+
 // ============ fishhook：UDP 透明重定向到中继 ============
 typedef int (*connect_t)(int, const struct sockaddr*, socklen_t);
 typedef ssize_t (*sendto_t)(int, const void*, size_t, int, const struct sockaddr*, socklen_t);
@@ -156,6 +178,10 @@ static int rewrite_to_relay(const struct sockaddr* addr, struct sockaddr_in* na)
     int port = ntohs(sin->sin_port);
     if (is_loopback(ip)) return 0;          // 回环不碰：本地 client↔server
     if (is_relay(ip, port)) return 0;       // 已是中继：避免自环
+    // 游戏自身的服务端/分片端口保持本地通信：主机侧 RakNet 启动自测发送
+    // (SOCKET_FAILED_TEST_SEND) 与分片互联走本地地址，若被重定到中继会失败。
+    // 这些端口只用于本机/局域网，加入者经中继(12000)连接，不受此豁免影响。
+    if (port == 10999 || port == 10888) return 0;
     memcpy(na, sin, sizeof(*na));
     na->sin_addr.s_addr = g_relay_ip;
     na->sin_port = htons(DST_RELAY_PORT);
@@ -165,7 +191,9 @@ static int rewrite_to_relay(const struct sockaddr* addr, struct sockaddr_in* na)
 static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) {
     if (sock_type(socket) == SOCK_DGRAM) {
         struct sockaddr_in na;
-        if (rewrite_to_relay(addr, &na)) {
+        int red = rewrite_to_relay(addr, &na);
+        dst_diag("connect", socket, addr ? addr->sa_family : 0, addr, red);
+        if (red) {
             LOGD("connect(UDP) -> relay");
             return orig_connect(socket, (const struct sockaddr*)&na, sizeof(na));
         }
@@ -177,7 +205,9 @@ static ssize_t fake_sendto(int socket, const void* buffer, size_t length, int fl
                             const struct sockaddr* dest_addr, socklen_t dest_len) {
     if (sock_type(socket) == SOCK_DGRAM) {
         struct sockaddr_in na;
-        if (rewrite_to_relay(dest_addr, &na)) {
+        int red = rewrite_to_relay(dest_addr, &na);
+        dst_diag("sendto", socket, dest_addr ? dest_addr->sa_family : 0, dest_addr, red);
+        if (red) {
             return orig_sendto(socket, buffer, length, flags,
                                (const struct sockaddr*)&na, sizeof(na));
         }
@@ -187,11 +217,18 @@ static ssize_t fake_sendto(int socket, const void* buffer, size_t length, int fl
 
 static int fake_bind(int socket, const struct sockaddr* addr, socklen_t len) {
     int r = orig_bind(socket, addr, len);
-    if (r == 0 && sock_type(socket) == SOCK_DGRAM && addr && addr->sa_family == AF_INET) {
-        const struct sockaddr_in* sin = (const struct sockaddr_in*)(const void*)addr;
+    if (r == 0 && sock_type(socket) == SOCK_DGRAM && addr) {
+        int fam = addr->sa_family;
+        int is_any = 0;
+        if (fam == AF_INET) {
+            const struct sockaddr_in* sin = (const struct sockaddr_in*)(const void*)addr;
+            is_any = (sin->sin_addr.s_addr == INADDR_ANY);
+        }
+        // 记录所有 UDP bind（含回环 127.0.0.1 与 IPv6 ::1），便于看清分片对等体的绑定地址
+        dst_diag("bind", socket, fam, addr, is_any);
         // 房主游戏服务器监听 0.0.0.0(UDP)：主动发 1 字节注册包到中继，
         // 让中继记录房主出口地址，加入者才能被转发过来（NAT 打洞）。
-        if (sin->sin_addr.s_addr == INADDR_ANY) {
+        if (fam == AF_INET && is_any) {
             struct sockaddr_in na;
             memset(&na, 0, sizeof(na));
             na.sin_family = AF_INET;
