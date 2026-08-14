@@ -13,6 +13,12 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
 
+      - name: Fetch fishhook (GOT rebinding, arm64e-safe — replaces Dobby)
+        run: |
+          curl -L https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.c -o fishhook.c
+          curl -L https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.h -o fishhook.h
+          ls -l fishhook.c fishhook.h
+
       - name: Compile libIOSVISION.dylib
         run: |
           mv hook_engine_ios_final.cpp hook_engine_ios_final.mm
@@ -21,14 +27,12 @@ jobs:
             -dynamiclib -fobjc-arc -std=c++17 \
             -framework Foundation -framework UIKit \
             -install_name @rpath/libIOSVISION.dylib \
-            hook_engine_ios_final.mm \
-            libdobby.a \
+            hook_engine_ios_final.mm fishhook.c \
             -o libIOSVISION.dylib
 
       - name: Ad-hoc codesign (avoid unsigned dylib rejected by dyld)
         run: |
           codesign --force --sign - libIOSVISION.dylib || true
-          # 确认签名存在
           codesign -dvv libIOSVISION.dylib 2>&1 | head -20 || true
 
       - name: Verify
