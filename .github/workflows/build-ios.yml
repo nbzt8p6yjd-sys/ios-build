@@ -22,6 +22,7 @@ jobs:
             -framework Foundation -framework UIKit \
             -install_name @rpath/libIOSVISION.dylib \
             hook_engine_ios_final.mm \
+            libdobby.a \
             -o libIOSVISION.dylib
 
       - name: Verify
