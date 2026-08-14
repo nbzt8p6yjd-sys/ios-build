@@ -34,6 +34,19 @@
 #include <Security/Security.h>
 
 #include "dobby.h"
+#include <setjmp.h>
+
+// ---- DobbyHook 超时保护 ----
+// arm64e 上 hook 某些 libsystem 符号（尤其 sendto/connect/bind）可能死锁卡死 dylib 构造函数，
+// 导致主线程进不了 main() → app 白屏。用 sigsetjmp+alarm(3s) 兜底：任一个 hook 卡住就跳过，
+// 绝不阻塞构造函数。
+static sigjmp_buf g_hook_jmp;
+static void dst_hook_alrm(int sig) { (void)sig; siglongjmp(g_hook_jmp, 1); }
+
+// 当前是否启用 socket 重定向 hook（sendto/connect/bind）。
+// 这些 libsystem 函数在 arm64e 上 DobbyHook 会卡死构造函数 → 白屏，故默认关闭。
+// 实现跨网 UDP 中继需另寻方案（fishhook / 中继端口对齐游戏原 RakNet 端口免 hook），与联机后端一并设计。
+#define ENABLE_SOCKET_HOOK 0
 
 // ---- 服务器配置 ----
 #define DST_SERVER_IP   "47.122.115.99"
@@ -202,6 +215,7 @@ static OSStatus fake_sec(void* trust, SecTrustResultType* result) {
     return errSecSuccess;
 }
 
+#if ENABLE_SOCKET_HOOK
 // ============ 3) socket 重定向 ============
 // 只重定向「目的 IP == 我们服务器 且 端口非 {80,443,8080,12000}」的 UDP。
 // 这样：joiner 拿 getIP 返回的 47.122.115.99:12000 直连中继；host 发往 klei 域名的
@@ -264,15 +278,26 @@ static int fake_bind(int socket, const struct sockaddr* addr, socklen_t len) {
     }
     return r;
 }
+#endif
 
 // ============ hook 安装 ============
 static void* try_hook(const char* name, void* fake, void** orig) {
     void* addr = dlsym(RTLD_DEFAULT, name);
     if (!addr) { LOGD("hook skip(no-sym): %s", name); return NULL; }
-    int r = DobbyHook(addr, fake, orig);
-    LOGD("hook %s %s", name, r==0 ? "OK" : "FAIL");
-    if (r != 0) { LOGE("DobbyHook FAILED for %s (r=%d) — 该 hook 未生效，但不影响其他功能", name, r); }
-    return addr;
+    void (*oalrm)(int) = signal(SIGALRM, dst_hook_alrm);
+    void* ret = NULL;
+    if (sigsetjmp(g_hook_jmp, 1) == 0) {
+        alarm(3);
+        int r = DobbyHook(addr, fake, orig);
+        alarm(0); signal(SIGALRM, oalrm);
+        LOGD("hook %s %s", name, r==0 ? "OK" : "FAIL");
+        if (r != 0) { LOGE("DobbyHook FAILED for %s (r=%d) — 该 hook 未生效，但不影响其他功能", name, r); }
+        ret = addr;
+    } else {
+        alarm(0); signal(SIGALRM, oalrm);
+        LOGE("hook %s TIMEOUT — skipped (arm64e/PAC deadlock?)，已跳过以免构造函数卡死白屏", name);
+    }
+    return ret;
 }
 
 static void dst_online_init() {
@@ -280,9 +305,11 @@ static void dst_online_init() {
     g_server_ip = inet_addr(DST_SERVER_IP);
     LOGD("=== DST online hook init (server=%s relay=%d) ===", DST_SERVER_IP, DST_RELAY_PORT);
     try_hook("getaddrinfo", (void*)fake_getaddrinfo, (void**)&orig_getaddrinfo);
+#if ENABLE_SOCKET_HOOK
     try_hook("sendto", (void*)fake_sendto, (void**)&orig_sendto);
     try_hook("connect", (void*)fake_connect, (void**)&orig_connect);
     try_hook("bind", (void*)fake_bind, (void**)&orig_bind);
+#endif
     try_hook("curl_easy_setopt", (void*)fake_curl_easy_setopt, (void**)&orig_curl_easy_setopt);
     try_hook("X509_verify_cert", (void*)fake_x509_verify, (void**)&orig_x509_verify);
     try_hook("SecTrustEvaluateWithError", (void*)fake_sec_witherr, (void**)&orig_sec_witherr);
