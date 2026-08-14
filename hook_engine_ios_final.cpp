@@ -94,9 +94,16 @@ static void dst_signal_handler(int sig) {
         (sig == SIGBUS)  ? "SIGBUS"  :
         (sig == SIGABRT) ? "SIGABRT" :
         (sig == SIGTRAP) ? "SIGTRAP" : "SIG?";
-    dst_panic([[NSString stringWithFormat:@"CRASH signal=%s (可能是 hook/PAC 相关)",
-                [NSString stringWithUTF8String:name]] UTF8String]);
+    dst_panic([[NSString stringWithFormat:@"CRASH signal=%s (可能是 hook/PAC 相关)", name] UTF8String]);
     _exit(1);
+}
+
+// 未捕获 Objective-C 异常的 C 处理函数（NSSetUncaughtExceptionHandler 只接受 C 函数指针，不能传 block）
+static void dst_uncaught_handler(NSException* e) {
+    @autoreleasepool {
+        NSString* desc = e ? [e description] : @"(null)";
+        dst_panic([[NSString stringWithFormat:@"NSException: %@", desc] UTF8String]);
+    }
 }
 
 // ============ 最优先构造函数：加载标记 + 崩溃捕获 ============
@@ -111,9 +118,7 @@ static void dst_load_marker() {
     signal(SIGBUS,  dst_signal_handler);
     signal(SIGABRT, dst_signal_handler);
     signal(SIGTRAP, dst_signal_handler);
-    NSSetUncaughtExceptionHandler(^(NSException* e){
-        dst_panic([[NSString stringWithFormat:@"NSException: %@", e] UTF8String]);
-    });
+    NSSetUncaughtExceptionHandler(dst_uncaught_handler);
     LOGD("crash handlers installed");
 }
 
