@@ -125,11 +125,15 @@ static void dst_load_marker() {
 }
 
 // ---- 地址判定 ----
-static int is_loopback(uint32_t ip_host) {
-    return (ip_host & 0xFF000000u) == 0x7F000000u;   // 127.0.0.0/8
+// 重要：sin_addr.s_addr 是「网络字节序」，必须先 ntohl 转主机序再按字节比较，
+// 否则 127.0.0.1 会被误判为非回环 → 回环流量被错重定到中继（已踩坑：建房时
+// 服务端回客户端的 ping 应答被改写到中继，客户端永远收不到 → "服务器无应答")。
+static int is_loopback(uint32_t ip_net) {
+    uint32_t ip = ntohl(ip_net);
+    return (ip & 0xFF000000u) == 0x7F000000u;   // 127.0.0.0/8
 }
-static int is_relay(uint32_t ip_host, int port) {
-    return ip_host == g_relay_ip && port == DST_RELAY_PORT;
+static int is_relay(uint32_t ip_net, int port) {
+    return ip_net == g_relay_ip && port == DST_RELAY_PORT;   // 二者皆网络序，直接比
 }
 
 // ---- 诊断日志（仅建房/联机排错用，限行数避免刷屏）----
@@ -176,12 +180,8 @@ static int rewrite_to_relay(const struct sockaddr* addr, struct sockaddr_in* na)
     const struct sockaddr_in* sin = (const struct sockaddr_in*)(const void*)addr;
     uint32_t ip = sin->sin_addr.s_addr;
     int port = ntohs(sin->sin_port);
-    if (is_loopback(ip)) return 0;          // 回环不碰：本地 client↔server
+    if (is_loopback(ip)) return 0;          // 回环不碰：本地 client↔server / 分片自测
     if (is_relay(ip, port)) return 0;       // 已是中继：避免自环
-    // 游戏自身的服务端/分片端口保持本地通信：主机侧 RakNet 启动自测发送
-    // (SOCKET_FAILED_TEST_SEND) 与分片互联走本地地址，若被重定到中继会失败。
-    // 这些端口只用于本机/局域网，加入者经中继(12000)连接，不受此豁免影响。
-    if (port == 10999 || port == 10888) return 0;
     memcpy(na, sin, sizeof(*na));
     na->sin_addr.s_addr = g_relay_ip;
     na->sin_port = htons(DST_RELAY_PORT);
