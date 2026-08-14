@@ -1,10 +1,17 @@
 /*
- * iOS DST 私有服在线联机注入器 v1.0
+ * iOS DST 私有服在线联机注入器 v1.1
  * 在原有"皮肤解锁注入"(IOSVISION v6.1) 基础上，新增三合一在线联机 hook：
  *  1) 域名重定向：把 klei / epic 相关域名解析到我们的服务器 47.122.115.99
  *  2) 证书绕过：让 libcurl / OpenSSL 不校验我们自签证书（多层兜底）
  *  3) socket 重定向：把游戏发往我们服务器的外部游戏 UDP 引到中继端口 12000
  * 目标：完全替代官方在线联机（房间列表 + 跨网中继），iPhone↔iPhone/Android 异地联机。
+ *
+ * v1.1 诊断加固：
+ *  - 最优先构造函数(dst_load_marker, priority 100)在 dyld 加载阶段就建好 Documents
+ *    目录并写入 "=== DYLIB LOADED ===" 标记，确保即使后续崩溃也能证明 dylib 已加载。
+ *  - 安装 SIGILL/SIGSEGV/SIGBUS/SIGABRT/SIGTRAP 信号处理器 + NSUncaughtExceptionHandler，
+ *    任何崩溃都会把原因追加写入 dst_hook.log（避免"闪退且零日志"无法定位）。
+ *  - hook 逐个记录成败，失败不致命（继续运行原有功能）。
  *
  * 编译见 .github/workflows/build-ios.yml，产出 libIOSVISION.dylib。
  */
@@ -14,6 +21,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdarg.h>
+#include <signal.h>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -33,14 +41,39 @@
 
 // ---- 文件日志（真机反馈用，写 Documents/dst_hook.log） ----
 static FILE* g_log = NULL;
-static void dst_log(const char* fmt, ...) {
-    if (!g_log) {
-        @autoreleasepool {
-            NSString* home = NSHomeDirectory();
-            NSString* path = [home stringByAppendingPathComponent:@"Documents/dst_hook.log"];
-            g_log = fopen([path UTF8String], "a");
-        }
+
+// 确保日志目录存在并打开文件（首次启动 iOS 可能还没建 Documents，必须先 mkdir）
+static void dst_ensure_log() {
+    if (g_log) return;
+    @autoreleasepool {
+        NSString* home = NSHomeDirectory();
+        NSString* dir  = [home stringByAppendingPathComponent:@"Documents"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                      withIntermediateDirectories:YES
+                                                       attributes:nil
+                                                            error:nil];
+        NSString* path = [dir stringByAppendingPathComponent:@"dst_hook.log"];
+        g_log = fopen([path UTF8String], "a");
     }
+}
+
+// 紧急日志：不依赖 g_log，单独开文件追加后关闭（供崩溃处理器使用，最稳妥）
+static void dst_panic(const char* msg) {
+    @autoreleasepool {
+        NSString* home = NSHomeDirectory();
+        NSString* dir  = [home stringByAppendingPathComponent:@"Documents"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                      withIntermediateDirectories:YES
+                                                       attributes:nil
+                                                            error:nil];
+        NSString* path = [dir stringByAppendingPathComponent:@"dst_hook.log"];
+        FILE* f = fopen([path UTF8String], "a");
+        if (f) { fprintf(f, "[PANIC] %s\n", msg ? msg : "(null)"); fflush(f); fclose(f); }
+    }
+}
+
+static void dst_log(const char* fmt, ...) {
+    dst_ensure_log();
     if (g_log) {
         va_list ap; va_start(ap, fmt);
         vfprintf(g_log, fmt, ap);
@@ -52,6 +85,37 @@ static void dst_log(const char* fmt, ...) {
 
 #define LOGD(fmt, ...) do { fprintf(stderr, "[DSTHOOK] " fmt "\n", ##__VA_ARGS__); dst_log(fmt, ##__VA_ARGS__); } while(0)
 #define LOGE(fmt, ...) do { fprintf(stderr, "[DSTHOOK ERR] " fmt "\n", ##__VA_ARGS__); dst_log("[ERR] " fmt, ##__VA_ARGS__); } while(0)
+
+// ---- 崩溃信号 / 异常捕获：让任何崩溃都留痕 ----
+static void dst_signal_handler(int sig) {
+    const char* name =
+        (sig == SIGILL)  ? "SIGILL"  :
+        (sig == SIGSEGV) ? "SIGSEGV" :
+        (sig == SIGBUS)  ? "SIGBUS"  :
+        (sig == SIGABRT) ? "SIGABRT" :
+        (sig == SIGTRAP) ? "SIGTRAP" : "SIG?";
+    dst_panic([[NSString stringWithFormat:@"CRASH signal=%s (可能是 hook/PAC 相关)",
+                [NSString stringWithUTF8String:name]] UTF8String]);
+    _exit(1);
+}
+
+// ============ 最优先构造函数：加载标记 + 崩溃捕获 ============
+// priority 100 保证在 iosvision_init / dst_online_init 之前运行，
+// 这样即便后面任何构造函数或 hook 崩溃，至少能证明 dylib 已成功加载。
+__attribute__((constructor(100)))
+static void dst_load_marker() {
+    dst_ensure_log();
+    LOGD("=== DYLIB LOADED (libIOSVISION v1.1) ===");
+    signal(SIGILL,  dst_signal_handler);
+    signal(SIGSEGV, dst_signal_handler);
+    signal(SIGBUS,  dst_signal_handler);
+    signal(SIGABRT, dst_signal_handler);
+    signal(SIGTRAP, dst_signal_handler);
+    NSSetUncaughtExceptionHandler(^(NSException* e){
+        dst_panic([[NSString stringWithFormat:@"NSException: %@", e] UTF8String]);
+    });
+    LOGD("crash handlers installed");
+}
 
 // ---- 工具：是否私网/回环（这里其实用不到，重定向只看目的 IP 是否等于服务器） ----
 static int is_internal(uint32_t ip_host) {
@@ -202,10 +266,12 @@ static void* try_hook(const char* name, void* fake, void** orig) {
     if (!addr) { LOGD("hook skip(no-sym): %s", name); return NULL; }
     int r = DobbyHook(addr, fake, orig);
     LOGD("hook %s %s", name, r==0 ? "OK" : "FAIL");
+    if (r != 0) { LOGE("DobbyHook FAILED for %s (r=%d) — 该 hook 未生效，但不影响其他功能", name, r); }
     return addr;
 }
 
 static void dst_online_init() {
+    dst_ensure_log();
     g_server_ip = inet_addr(DST_SERVER_IP);
     LOGD("=== DST online hook init (server=%s relay=%d) ===", DST_SERVER_IP, DST_RELAY_PORT);
     try_hook("getaddrinfo", (void*)fake_getaddrinfo, (void**)&orig_getaddrinfo);
