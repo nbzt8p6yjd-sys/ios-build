@@ -1,17 +1,18 @@
 /*
- * iOS DST 私有服在线联机注入器 v3.0  (DYLD_INTERPOSE 版，arm64e 安全)
+ * iOS DST 私有服在线联机注入器 v4.0  (dyld_dynamic_interpose 运行时版，arm64e 安全，dyld4 兼容)
  *
  * 设计目标：完全替代官方在线联机，让游戏原生 UI（建房 / 直连）直接跨网可用，
  *          不再依赖任何 Lua 房间屏，也不再使用 Dobby（Dobby 在 iOS arm64e 上
  *          PAC 跳板不兼容 → 白屏 / SIGBUS 崩，已弃用），也不再使用 fishhook。
  *
  * 核心机制（二进制层面，透明）：
- *  - 用 **DYLD_INTERPOSE** 对 libsystem 的 connect / sendto / bind / open* / close* 做符号
- *    替换。DYLD_INTERPOSE 由 dyld 在镜像加载阶段完成替换，**不碰任何受写保护的
- *    内存页**（不写 __DATA_CONST.__got），因此 arm64e 链式修复 + 写保护页下绝不 SIGBUS。
- *    —— 这正是 fishhook rebind_symbols 在 1.3.0（arm64e 链式修复 + __DATA_CONST 写保护）
- *       上崩白屏的根因：它要改写 GOT 指针所在的受保护页，触发 SIGBUS，且构造函数
- *       顺序导致崩在日志打开之前 → 零日志。v3 彻底绕开该路径。
+ *  - 用 **dyld_dynamic_interpose()**（dyld4 官方运行时 API）对 libsystem 的
+ *    connect / sendto / bind / open* / close* 做符号替换。该 API 在构造函数里、
+ *    镜像已加载之后应用，**不碰任何受写保护的内存页**（不写 __DATA_CONST.__got），
+ *    因此 arm64e 链式修复 + 写保护页下绝不 SIGBUS，且不会像静态 __interpose 段那样
+ *    在 dyld4 加载期 closure 构建阶段被拒（那会导致进程在跑任何构造函数之前就被打掉
+ *    → 白屏、零日志，无法诊断）。dyld_dynamic_interpose 不可用时软失败（记日志、不崩）。
+ *    —— 这正是此前 fishhook(DYLD_INTERPOSE 静态段)在 1.3.0 上崩白屏的根因。
  *  - 游戏（DST）所有「非回环的外部 UDP」一律重写目的地址为我们的中继
  *    (47.122.115.99:12000)，由云端中继做 N-way 字节转发，实现 iPhone↔iPhone 跨网。
  *  - 回环(127.0.0.0/8)UDP 不动  → 房主本机 client↔server 正常（本地建房不受影响）。
@@ -119,7 +120,7 @@ __attribute__((constructor(1)))
 static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB LOADED (libIOSVISION v3.0 / DYLD_INTERPOSE) ===");
+    LOGD("=== DYLIB LOADED (libIOSVISION v4.0 / dyld_dynamic_interpose) ===");
     signal(SIGILL,  dst_signal_handler);
     signal(SIGSEGV, dst_signal_handler);
     signal(SIGBUS,  dst_signal_handler);
@@ -181,11 +182,19 @@ static openat_t  orig_openat_nocancel  = NULL;
 static close_t   orig_close            = NULL;
 static close_t   orig_close_nocancel   = NULL;
 
-// 在构造函数(constructor(2))里集中解析所有原始指针。此时 DYLD_INTERPOSE 已由 dyld
-// 应用完毕，dlsym(RTLD_NEXT, sym) 拿到的是 libSystem 里的真身（跳过本 dylib 的替换）。
-// 集中解析可彻底避免「fake 内调 dlsym 触发 fake 自身」的递归风险。
+// ============ 解析原始函数 + 运行时应用 hook（dyld4 兼容，v4.0 关键修正）============
+// 不再使用静态 __interpose 段（DYLD_INTERPOSE 宏）。在 iOS 15+ 的 dyld4 上，嵌入式
+// dylib 的静态 __interpose 段常在「加载期 launch closure 构建」阶段被 dyld 拒绝/异常
+// → 进程在跑任何构造函数之前就被打掉（白屏、零日志，无法诊断）。
+// 改为运行时调用 dyld 官方 API dyld_dynamic_interpose()：在构造函数里、镜像已加载之后
+// 应用，不写任何受保护内存页（arm64e 安全），且 dyld_dynamic_interpose 不存在时
+// 可软失败（记日志、不崩溃，游戏照常运行）。仅对 dlsym 解析到的非空原始指针建立元组，
+// 避免把某些环境缺失的 $NOCANCEL 变体塞进静态段导致加载期崩。
+typedef void (*dyld_dynamic_interpose_fn)(const void* tuples, size_t count);
+struct dyld_interpose_tuple_local { const void* replacement; const void* replacee; };
+
 __attribute__((constructor(2)))
-static void dst_resolve_originals() {
+static void dst_resolve_and_interpose() {
     orig_connect          = (connect_t)dlsym(RTLD_NEXT, "connect");
     orig_sendto           = (sendto_t)dlsym(RTLD_NEXT, "sendto");
     orig_bind             = (bind_t)dlsym(RTLD_NEXT, "bind");
@@ -199,6 +208,34 @@ static void dst_resolve_originals() {
     LOGD("originals resolved: connect=%p sendto=%p bind=%p open=%p openat=%p close=%p",
          (void*)orig_connect, (void*)orig_sendto, (void*)orig_bind,
          (void*)orig_open, (void*)orig_openat, (void*)orig_close);
+
+    dyld_dynamic_interpose_fn dyn_interpose =
+        (dyld_dynamic_interpose_fn)dlsym(RTLD_DEFAULT, "dyld_dynamic_interpose");
+    if (!dyn_interpose) {
+        LOGD("dyld_dynamic_interpose NOT available on this dyld -> hooks NOT applied (app still runs)");
+        return;
+    }
+    struct dyld_interpose_tuple_local tuples[9];
+    int n = 0;
+    #define ADD_TUPLE(fake, orig) do { \
+        if ((void*)(orig) != NULL) { \
+            tuples[n].replacement = (const void*)(unsigned long)(fake); \
+            tuples[n].replacee    = (const void*)(unsigned long)(orig); \
+            n++; \
+        } \
+    } while(0)
+    ADD_TUPLE(fake_connect, orig_connect);
+    ADD_TUPLE(fake_sendto, orig_sendto);
+    ADD_TUPLE(fake_bind, orig_bind);
+    ADD_TUPLE(fake_open, orig_open);
+    ADD_TUPLE(fake_open_nocancel, orig_open_nocancel);
+    ADD_TUPLE(fake_openat, orig_openat);
+    ADD_TUPLE(fake_openat_nocancel, orig_openat_nocancel);
+    ADD_TUPLE(fake_close, orig_close);
+    ADD_TUPLE(fake_close_nocancel, orig_close_nocancel);
+    #undef ADD_TUPLE
+    dyn_interpose(tuples, (size_t)n);
+    LOGD("dyld_dynamic_interpose applied (%d funcs)", n);
 }
 
 // ---- cluster_token.txt 空文件兜底（iOS 建房令牌校验，治本）----
@@ -483,7 +520,7 @@ static int fake_bind(int socket, const struct sockaddr* addr, socklen_t len) {
 static void dst_online_init() {
     dst_ensure_log();
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
-    LOGD("=== DST UDP relay init (relay=%s:%d, DYLD_INTERPOSE) ===", DST_RELAY_IP, DST_RELAY_PORT);
+    LOGD("=== DST UDP relay init (relay=%s:%d, dyld_dynamic_interpose) ===", DST_RELAY_IP, DST_RELAY_PORT);
     LOGD("=== DST UDP relay done ===");
 }
 
@@ -614,32 +651,10 @@ static void iosvision_init() {
     LOGD("Done.");
 }
 
-// ============ DYLD_INTERPOSE 注册（dyld 在镜像加载阶段应用，arm64e 安全）============
-// 用 dyld 内置的符号替换机制，完全不写受保护内存页，从根本上规避 fishhook 在
-// 1.3.0（arm64e 链式修复 + __DATA_CONST 写保护）上改写 GOT 指针导致的 SIGBUS 白屏。
+// ============ hook 注册（v4.0：运行时 dyld_dynamic_interpose，见 dst_resolve_and_interpose）============
+// 不再使用静态 __interpose 段（DYLD_INTERPOSE 宏会在 dyld4 加载期被拒 -> 白屏零日志）。
+// 符号替换改在构造函数里经 dyld 官方 API dyld_dynamic_interpose() 运行时应用，
+// 不写受保护内存页（arm64e 安全），且 dyld 不支持时软失败（记日志、不崩）。
+// 原始指针全部经 dlsym(RTLD_NEXT,...) 解析，fake_* 内只调 orig_*，杜绝递归。
+// $NOCANCEL 变体不再需要 extern "C" 声明（dlsym 用字符串名解析）。
 
-// open/openat/close 的 $NOCANCEL 变体是 Darwin libc 的 non-cancelable 符号（名字带 $），
-// SDK 头不声明其原型，必须显式 extern "C" 声明，否则 DYLD_INTERPOSE 报
-// "undeclared identifier"。第三个参数在 Libc 里就是 int（mode），非变参。
-extern "C" int open$NOCANCEL(const char* path, int flags, int mode);
-extern "C" int openat$NOCANCEL(int dirfd, const char* path, int flags, int mode);
-extern "C" int close$NOCANCEL(int fd);
-
-#define DYLD_INTERPOSE(_replacement, _replacee) \
-    __attribute__((used)) static struct { \
-        const void* replacement; \
-        const void* replacee; \
-    } _interpose_##_replacee __attribute__((section("__DATA,__interpose"))) = { \
-        (const void*)(unsigned long)&_replacement, \
-        (const void*)(unsigned long)&_replacee \
-    }
-
-DYLD_INTERPOSE(fake_connect, connect);
-DYLD_INTERPOSE(fake_sendto, sendto);
-DYLD_INTERPOSE(fake_bind, bind);
-DYLD_INTERPOSE(fake_open, open);
-DYLD_INTERPOSE(fake_open_nocancel, open$NOCANCEL);
-DYLD_INTERPOSE(fake_openat, openat);
-DYLD_INTERPOSE(fake_openat_nocancel, openat$NOCANCEL);
-DYLD_INTERPOSE(fake_close, close);
-DYLD_INTERPOSE(fake_close_nocancel, close$NOCANCEL);
