@@ -1,13 +1,17 @@
 /*
- * iOS DST 私有服在线联机注入器 v2.0  (fishhook 版，arm64e 安全)
+ * iOS DST 私有服在线联机注入器 v3.0  (DYLD_INTERPOSE 版，arm64e 安全)
  *
  * 设计目标：完全替代官方在线联机，让游戏原生 UI（建房 / 直连）直接跨网可用，
  *          不再依赖任何 Lua 房间屏，也不再使用 Dobby（Dobby 在 iOS arm64e 上
- *          PAC 跳板不兼容 → 白屏 / SIGBUS 崩，已弃用）。
+ *          PAC 跳板不兼容 → 白屏 / SIGBUS 崩，已弃用），也不再使用 fishhook。
  *
  * 核心机制（二进制层面，透明）：
- *  - 用 fishhook 对 libsystem 的 connect / sendto / bind 做 GOT 重绑定。
- *    fishhook 只改间接符号指针、不碰指令、不踩 PAC，因此在 arm64e 上安全。
+ *  - 用 **DYLD_INTERPOSE** 对 libsystem 的 connect / sendto / bind / open* / close* 做符号
+ *    替换。DYLD_INTERPOSE 由 dyld 在镜像加载阶段完成替换，**不碰任何受写保护的
+ *    内存页**（不写 __DATA_CONST.__got），因此 arm64e 链式修复 + 写保护页下绝不 SIGBUS。
+ *    —— 这正是 fishhook rebind_symbols 在 1.3.0（arm64e 链式修复 + __DATA_CONST 写保护）
+ *       上崩白屏的根因：它要改写 GOT 指针所在的受保护页，触发 SIGBUS，且构造函数
+ *       顺序导致崩在日志打开之前 → 零日志。v3 彻底绕开该路径。
  *  - 游戏（DST）所有「非回环的外部 UDP」一律重写目的地址为我们的中继
  *    (47.122.115.99:12000)，由云端中继做 N-way 字节转发，实现 iPhone↔iPhone 跨网。
  *  - 回环(127.0.0.0/8)UDP 不动  → 房主本机 client↔server 正常（本地建房不受影响）。
@@ -39,8 +43,6 @@
 #include <Foundation/Foundation.h>
 #include <UIKit/UIKit.h>
 #include <Security/Security.h>
-
-#include "fishhook.h"
 
 // ---- 中继配置（与 server/relay/relay_server.py 的 RELAY_BASE_PORT 对齐）----
 #define DST_RELAY_IP   "47.122.115.99"
@@ -112,11 +114,12 @@ static void dst_uncaught_handler(NSException* e) {
     }
 }
 
-// ============ 最优先构造函数：加载标记 + 崩溃捕获 ============
-__attribute__((constructor(100)))
+// ============ 最优先构造函数：加载标记 + 崩溃捕获（优先级 1，最先跑）============
+__attribute__((constructor(1)))
 static void dst_load_marker() {
+    if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB LOADED (libIOSVISION v2.0 / fishhook) ===");
+    LOGD("=== DYLIB LOADED (libIOSVISION v3.0 / DYLD_INTERPOSE) ===");
     signal(SIGILL,  dst_signal_handler);
     signal(SIGSEGV, dst_signal_handler);
     signal(SIGBUS,  dst_signal_handler);
@@ -160,22 +163,43 @@ static void dst_diag(const char* tag, int fd, int fam, const struct sockaddr* ad
     LOGD("[DIAG] %s fd=%d fam=%d %s:%d flag=%d", tag, fd, fam, ip, port, flag);
 }
 
-// ============ fishhook：UDP 透明重定向到中继 ============
+// ============ 原始函数指针（通过 dlsym(RTLD_NEXT) 在构造函数里解析，避免递归）============
 typedef int (*connect_t)(int, const struct sockaddr*, socklen_t);
 typedef ssize_t (*sendto_t)(int, const void*, size_t, int, const struct sockaddr*, socklen_t);
 typedef int (*bind_t)(int, const struct sockaddr*, socklen_t);
-
-static connect_t orig_connect = NULL;
-static sendto_t orig_sendto   = NULL;
-static bind_t   orig_bind     = NULL;
-
-// ---- cluster_token.txt 空文件兜底（iOS 建房令牌校验）----
 typedef int (*open_t)(const char*, int, ...);
 typedef int (*openat_t)(int, const char*, int, ...);
-static open_t   orig_open             = NULL;
-static open_t   orig_open_nocancel    = NULL;
-static openat_t orig_openat           = NULL;
-static openat_t orig_openat_nocancel  = NULL;
+typedef int (*close_t)(int);
+
+static connect_t orig_connect = NULL;
+static sendto_t  orig_sendto  = NULL;
+static bind_t    orig_bind    = NULL;
+static open_t    orig_open             = NULL;
+static open_t    orig_open_nocancel    = NULL;
+static openat_t  orig_openat           = NULL;
+static openat_t  orig_openat_nocancel  = NULL;
+static close_t   orig_close            = NULL;
+static close_t   orig_close_nocancel   = NULL;
+
+// 在构造函数(constructor(2))里集中解析所有原始指针。此时 DYLD_INTERPOSE 已由 dyld
+// 应用完毕，dlsym(RTLD_NEXT, sym) 拿到的是 libSystem 里的真身（跳过本 dylib 的替换）。
+// 集中解析可彻底避免「fake 内调 dlsym 触发 fake 自身」的递归风险。
+__attribute__((constructor(2)))
+static void dst_resolve_originals() {
+    orig_connect          = (connect_t)dlsym(RTLD_NEXT, "connect");
+    orig_sendto           = (sendto_t)dlsym(RTLD_NEXT, "sendto");
+    orig_bind             = (bind_t)dlsym(RTLD_NEXT, "bind");
+    orig_open             = (open_t)dlsym(RTLD_NEXT, "open");
+    orig_open_nocancel    = (open_t)dlsym(RTLD_NEXT, "open$NOCANCEL");
+    orig_openat           = (openat_t)dlsym(RTLD_NEXT, "openat");
+    orig_openat_nocancel  = (openat_t)dlsym(RTLD_NEXT, "openat$NOCANCEL");
+    orig_close            = (close_t)dlsym(RTLD_NEXT, "close");
+    orig_close_nocancel   = (close_t)dlsym(RTLD_NEXT, "close$NOCANCEL");
+    dst_ensure_log();
+    LOGD("originals resolved: connect=%p sendto=%p bind=%p open=%p openat=%p close=%p",
+         (void*)orig_connect, (void*)orig_sendto, (void*)orig_bind,
+         (void*)orig_open, (void*)orig_openat, (void*)orig_close);
+}
 
 // ---- cluster_token.txt 空文件兜底（iOS 建房令牌校验，治本）----
 // 真因（8 轮真机日志定位）：主进程写 cluster_token.txt 与拉起专用子进程(instance_2)
@@ -277,10 +301,6 @@ static void ensure_cluster_token_at(const char* path, int dirfd,
 // 否则有未定义行为（编译器 -Wvarargs 警告）。
 #define EXTRACT_MODE(flags, mode) \
     do { if (flags & O_CREAT) { va_list _ap; va_start(_ap, flags); (mode) = (mode_t)va_arg(_ap, int); va_end(_ap); } else { (mode) = 0; } } while(0)
-
-// close 兜底：子进程不载本 dylib，故改为在「父进程写」侧确保 cluster_token.txt 有有效令牌
-static int   (*orig_close)(int)          = NULL;
-static int   (*orig_close_nocancel)(int) = NULL;
 
 // 父进程打开 cluster_token.txt 写模式时记录 fd+路径；其 close 时把文件重写为有效令牌
 static int   g_tok_wfd   = -1;
@@ -403,6 +423,7 @@ static int rewrite_to_relay(const struct sockaddr* addr, struct sockaddr_in* na)
 }
 
 static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) {
+    if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     if (sock_type(socket) == SOCK_DGRAM) {
         struct sockaddr_in na;
         int red = rewrite_to_relay(addr, &na);
@@ -417,6 +438,7 @@ static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) 
 
 static ssize_t fake_sendto(int socket, const void* buffer, size_t length, int flags,
                             const struct sockaddr* dest_addr, socklen_t dest_len) {
+    if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     if (sock_type(socket) == SOCK_DGRAM) {
         struct sockaddr_in na;
         int red = rewrite_to_relay(dest_addr, &na);
@@ -430,6 +452,7 @@ static ssize_t fake_sendto(int socket, const void* buffer, size_t length, int fl
 }
 
 static int fake_bind(int socket, const struct sockaddr* addr, socklen_t len) {
+    if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     int r = orig_bind(socket, addr, len);
     if (r == 0 && sock_type(socket) == SOCK_DGRAM && addr) {
         int fam = addr->sa_family;
@@ -459,26 +482,12 @@ static int fake_bind(int socket, const struct sockaddr* addr, socklen_t len) {
 
 static void dst_online_init() {
     dst_ensure_log();
-    g_relay_ip = inet_addr(DST_RELAY_IP);
-    LOGD("=== DST UDP relay init (relay=%s:%d) ===", DST_RELAY_IP, DST_RELAY_PORT);
-
-    struct rebinding rebinds[] = {
-        {"connect", (void*)fake_connect, (void**)&orig_connect},
-        {"sendto",  (void*)fake_sendto,  (void**)&orig_sendto},
-        {"bind",    (void*)fake_bind,    (void**)&orig_bind},
-        {"open",            (void*)fake_open,            (void**)&orig_open},
-        {"open$NOCANCEL",   (void*)fake_open_nocancel,   (void**)&orig_open_nocancel},
-        {"openat",          (void*)fake_openat,          (void**)&orig_openat},
-        {"openat$NOCANCEL", (void*)fake_openat_nocancel, (void**)&orig_openat_nocancel},
-        {"close",           (void*)fake_close,           (void**)&orig_close},
-        {"close$NOCANCEL",  (void*)fake_close_nocancel,  (void**)&orig_close_nocancel},
-    };
-    int rc = rebind_symbols(rebinds, sizeof(rebinds)/sizeof(rebinds[0]));
-    LOGD("rebind_symbols rc=%d (0=OK)", rc);
+    if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
+    LOGD("=== DST UDP relay init (relay=%s:%d, DYLD_INTERPOSE) ===", DST_RELAY_IP, DST_RELAY_PORT);
     LOGD("=== DST UDP relay done ===");
 }
 
-__attribute__((constructor))
+__attribute__((constructor(100)))
 static void dst_online_ctor() {
     dst_online_init();
 }
@@ -533,7 +542,7 @@ static bool patch_cache(NSString* cachePath, NSString* userId) {
     return [patchedData writeToFile:cachePath atomically:YES];
 }
 
-__attribute__((constructor))
+__attribute__((constructor(101)))
 static void iosvision_init() {
     LOGD("IOSVISION v6.1 - One shot");
 
@@ -604,3 +613,25 @@ static void iosvision_init() {
 
     LOGD("Done.");
 }
+
+// ============ DYLD_INTERPOSE 注册（dyld 在镜像加载阶段应用，arm64e 安全）============
+// 用 dyld 内置的符号替换机制，完全不写受保护内存页，从根本上规避 fishhook 在
+// 1.3.0（arm64e 链式修复 + __DATA_CONST 写保护）上改写 GOT 指针导致的 SIGBUS 白屏。
+#define DYLD_INTERPOSE(_replacement, _replacee) \
+    __attribute__((used)) static struct { \
+        const void* replacement; \
+        const void* replacee; \
+    } _interpose_##_replacee __attribute__((section("__DATA,__interpose"))) = { \
+        (const void*)(unsigned long)&_replacement, \
+        (const void*)(unsigned long)&_replacee \
+    }
+
+DYLD_INTERPOSE(fake_connect, connect);
+DYLD_INTERPOSE(fake_sendto, sendto);
+DYLD_INTERPOSE(fake_bind, bind);
+DYLD_INTERPOSE(fake_open, open);
+DYLD_INTERPOSE(fake_open_nocancel, open$NOCANCEL);
+DYLD_INTERPOSE(fake_openat, openat);
+DYLD_INTERPOSE(fake_openat_nocancel, openat$NOCANCEL);
+DYLD_INTERPOSE(fake_close, close);
+DYLD_INTERPOSE(fake_close_nocancel, close$NOCANCEL);
