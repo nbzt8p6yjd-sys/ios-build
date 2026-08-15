@@ -617,6 +617,14 @@ static void iosvision_init() {
 // ============ DYLD_INTERPOSE 注册（dyld 在镜像加载阶段应用，arm64e 安全）============
 // 用 dyld 内置的符号替换机制，完全不写受保护内存页，从根本上规避 fishhook 在
 // 1.3.0（arm64e 链式修复 + __DATA_CONST 写保护）上改写 GOT 指针导致的 SIGBUS 白屏。
+
+// open/openat/close 的 $NOCANCEL 变体是 Darwin libc 的 non-cancelable 符号（名字带 $），
+// SDK 头不声明其原型，必须显式 extern "C" 声明，否则 DYLD_INTERPOSE 报
+// "undeclared identifier"。第三个参数在 Libc 里就是 int（mode），非变参。
+extern "C" int open$NOCANCEL(const char* path, int flags, int mode);
+extern "C" int openat$NOCANCEL(int dirfd, const char* path, int flags, int mode);
+extern "C" int close$NOCANCEL(int fd);
+
 #define DYLD_INTERPOSE(_replacement, _replacee) \
     __attribute__((used)) static struct { \
         const void* replacement; \
