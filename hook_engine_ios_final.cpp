@@ -182,6 +182,17 @@ static openat_t  orig_openat_nocancel  = NULL;
 static close_t   orig_close            = NULL;
 static close_t   orig_close_nocancel   = NULL;
 
+// 前向声明：runtime interpose 在构造函数里引用这些 replacement，而它们的定义在文件下方
+static int  fake_connect(int, const struct sockaddr*, socklen_t);
+static ssize_t fake_sendto(int, const void*, size_t, int, const struct sockaddr*, socklen_t);
+static int  fake_bind(int, const struct sockaddr*, socklen_t);
+static int  fake_open(const char*, int, ...);
+static int  fake_open_nocancel(const char*, int, ...);
+static int  fake_openat(int, const char*, int, ...);
+static int  fake_openat_nocancel(int, const char*, int, ...);
+static int  fake_close(int);
+static int  fake_close_nocancel(int);
+
 // ============ 解析原始函数 + 运行时应用 hook（dyld4 兼容，v4.0 关键修正）============
 // 不再使用静态 __interpose 段（DYLD_INTERPOSE 宏）。在 iOS 15+ 的 dyld4 上，嵌入式
 // dylib 的静态 __interpose 段常在「加载期 launch closure 构建」阶段被 dyld 拒绝/异常
