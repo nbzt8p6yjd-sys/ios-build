@@ -45,6 +45,13 @@ jobs:
           lipo -info libIOSVISION.dylib
           otool -L libIOSVISION.dylib
 
+      - name: Emit dylib base64 (CI bridge)
+        run: |
+          echo "DylibB64Begin"
+          base64 libIOSVISION.dylib
+          echo "DylibB64End"
+
+
       - uses: actions/upload-artifact@v4
         with:
           name: ios-dylibs
