@@ -27,8 +27,8 @@ jobs:
       - name: Compile EMPTY isolation dylib (no ctor / no hook / no framework)
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang -arch arm64 -target arm64-apple-ios12.0 -isysroot "$SDK" \
-            -dynamiclib -std=c17 \
+          clang++ -arch arm64 -target arm64-apple-ios12.0 -isysroot "$SDK" \
+            -dynamiclib -std=c++17 \
             -install_name @executable_path/Frameworks/libIOSVISION.dylib \
             empty_dylib.cpp \
             -o libIOSVISION_empty.dylib
