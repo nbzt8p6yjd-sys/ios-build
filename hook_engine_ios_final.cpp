@@ -182,6 +182,17 @@ static openat_t  orig_openat_nocancel  = NULL;
 static close_t   orig_close            = NULL;
 static close_t   orig_close_nocancel   = NULL;
 
+// ---- C-stdio 文件写路径（DST 是 C++ 引擎，很可能走 fopen/fwrite/fclose，而非 POSIX open）----
+typedef FILE* (*fopen_t)(const char*, const char*);
+typedef int   (*fclose_t)(FILE*);
+static fopen_t  orig_fopen            = NULL;
+static fclose_t orig_fclose           = NULL;
+
+// ---- Foundation 写方法 swizzle 原始 IMP（编译单元为 .mm + -fobjc-arc）----
+static BOOL (*orig_NSData_wtf)(id, SEL, NSString*, BOOL) = NULL;
+static BOOL (*orig_NSString_wtf)(id, SEL, NSString*, BOOL, NSStringEncoding, NSError**) = NULL;
+static BOOL (*orig_NSMgr_createFile)(id, SEL, NSString*, NSData*, NSDictionary*) = NULL;
+
 // 前向声明：runtime interpose 在构造函数里引用这些 replacement，而它们的定义在文件下方
 static int  fake_connect(int, const struct sockaddr*, socklen_t);
 static ssize_t fake_sendto(int, const void*, size_t, int, const struct sockaddr*, socklen_t);
@@ -192,6 +203,8 @@ static int  fake_openat(int, const char*, int, ...);
 static int  fake_openat_nocancel(int, const char*, int, ...);
 static int  fake_close(int);
 static int  fake_close_nocancel(int);
+static FILE* fake_fopen(const char*, const char*);
+static int   fake_fclose(FILE*);
 
 // ============ 解析原始函数 + 运行时应用 hook（dyld4 兼容，v4.0 关键修正）============
 // 不再使用静态 __interpose 段（DYLD_INTERPOSE 宏）。在 iOS 15+ 的 dyld4 上，嵌入式
@@ -226,7 +239,7 @@ static void dst_resolve_and_interpose() {
         LOGD("dyld_dynamic_interpose NOT available on this dyld -> hooks NOT applied (app still runs)");
         return;
     }
-    struct dyld_interpose_tuple_local tuples[9];
+    struct dyld_interpose_tuple_local tuples[11];
     int n = 0;
     #define ADD_TUPLE(fake, orig) do { \
         if ((void*)(orig) != NULL) { \
@@ -244,6 +257,8 @@ static void dst_resolve_and_interpose() {
     ADD_TUPLE(fake_openat_nocancel, orig_openat_nocancel);
     ADD_TUPLE(fake_close, orig_close);
     ADD_TUPLE(fake_close_nocancel, orig_close_nocancel);
+    ADD_TUPLE(fake_fopen, orig_fopen);
+    ADD_TUPLE(fake_fclose, orig_fclose);
     #undef ADD_TUPLE
     dyn_interpose(tuples, (size_t)n);
     LOGD("dyld_dynamic_interpose applied (%d funcs)", n);
@@ -668,4 +683,107 @@ static void iosvision_init() {
 // 不写受保护内存页（arm64e 安全），且 dyld 不支持时软失败（记日志、不崩）。
 // 原始指针全部经 dlsym(RTLD_NEXT,...) 解析，fake_* 内只调 orig_*，杜绝递归。
 // $NOCANCEL 变体不再需要 extern "C" 声明（dlsym 用字符串名解析）。
+
+// ============ 新增：C-stdio fopen/fclose hook（覆盖 C++ 引擎用 fopen 写 cluster_token.txt 的路径）============
+static FILE* g_tok_wfile = NULL;   // 与 POSIX 的 g_tok_wfd(int) 区分，避免类型混淆
+
+static FILE* fake_fopen(const char* path, const char* mode) {
+    FILE* f = orig_fopen ? orig_fopen(path, mode) : fopen(path, mode);
+    if (f && !g_open_reent && path && path_is_cluster_token(path) && mode) {
+        // 仅记录写模式（w/a/+），只读不清空
+        if (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')) {
+            g_tok_wfile = f;
+            strncpy(g_tok_wpath, path, sizeof(g_tok_wpath) - 1);
+            g_tok_wpath[sizeof(g_tok_wpath) - 1] = '\0';
+            if (g_token_inject_log++ < 8)
+                LOGD("cluster_token.txt fopen(w) recorded (via C-stdio)");
+        }
+    }
+    return f;
+}
+
+static int fake_fclose(FILE* f) {
+    if (f && f == g_tok_wfile) {
+        g_tok_wfile = NULL;
+        rewrite_cluster_token_on_close();   // 复用：基于 g_tok_wpath 用 orig_open 重写令牌
+    }
+    return orig_fclose ? orig_fclose(f) : fclose(f);
+}
+
+// ============ 新增：Foundation 写方法 swizzle（覆盖游戏走 NSData/NSString/NSFileManager 写 cluster_token.txt 的路径）============
+// 编译单元为 .mm + -fobjc-arc，此处可直接写 Objective-C。
+static NSString* gen_klei_token_ns(void) {
+    char buf[128];
+    gen_klei_token(buf, sizeof(buf));
+    return [NSString stringWithUTF8String:buf];
+}
+
+static BOOL swiz_NSData_wtf(id self, SEL _cmd, NSString* path, BOOL atomically) {
+    if (path && [path rangeOfString:@"cluster_token.txt"].location != NSNotFound) {
+        if (g_token_inject_log++ < 8)
+            LOGD("cluster_token.txt write via NSData -> injecting token");
+        NSData* tok = [gen_klei_token_ns() dataUsingEncoding:NSUTF8StringEncoding];
+        if (!tok) tok = [NSData data];
+        return orig_NSData_wtf(tok, _cmd, path, atomically);
+    }
+    return orig_NSData_wtf(self, _cmd, path, atomically);
+}
+
+static BOOL swiz_NSString_wtf(id self, SEL _cmd, NSString* path, BOOL atomically,
+                              NSStringEncoding enc, NSError** err) {
+    if (path && [path rangeOfString:@"cluster_token.txt"].location != NSNotFound) {
+        if (g_token_inject_log++ < 8)
+            LOGD("cluster_token.txt write via NSString -> injecting token");
+        NSString* tok = gen_klei_token_ns();
+        return orig_NSString_wtf(tok, _cmd, path, atomically, enc, err);
+    }
+    return orig_NSString_wtf(self, _cmd, path, atomically, enc, err);
+}
+
+static BOOL swiz_NSMgr_createFile(id self, SEL _cmd, NSString* path, NSData* data, NSDictionary* attr) {
+    if (path && [path rangeOfString:@"cluster_token.txt"].location != NSNotFound) {
+        if (g_token_inject_log++ < 8)
+            LOGD("cluster_token.txt write via NSFileManager -> injecting token");
+        NSData* tok = [gen_klei_token_ns() dataUsingEncoding:NSUTF8StringEncoding];
+        if (!tok) tok = [NSData data];
+        return orig_NSMgr_createFile(self, _cmd, path, tok, attr);
+    }
+    return orig_NSMgr_createFile(self, _cmd, path, data, attr);
+}
+
+static void dst_swizzle_foundation(void) {
+    @try {
+        Method m; Class c;
+        c = [NSData class];
+        m = class_getInstanceMethod(c, @selector(writeToFile:atomically:));
+        if (m) {
+            orig_NSData_wtf = (BOOL(*)(id,SEL,NSString*,BOOL))method_getImplementation(m);
+            method_setImplementation(m, (IMP)swiz_NSData_wtf);
+            LOGD("swizzled NSData writeToFile:atomically:");
+        }
+        c = [NSString class];
+        m = class_getInstanceMethod(c, @selector(writeToFile:atomically:encoding:error:));
+        if (m) {
+            orig_NSString_wtf = (BOOL(*)(id,SEL,NSString*,BOOL,NSStringEncoding,NSError**))method_getImplementation(m);
+            method_setImplementation(m, (IMP)swiz_NSString_wtf);
+            LOGD("swizzled NSString writeToFile:encoding:error:");
+        }
+        c = [NSFileManager class];
+        m = class_getInstanceMethod(c, @selector(createFileAtPath:contents:attributes:));
+        if (m) {
+            orig_NSMgr_createFile = (BOOL(*)(id,SEL,NSString*,NSData*,NSDictionary*))method_getImplementation(m);
+            method_setImplementation(m, (IMP)swiz_NSMgr_createFile);
+            LOGD("swizzled NSFileManager createFileAtPath:contents:attributes:");
+        }
+    } @catch (NSException* e) {
+        LOGE("Foundation swizzle exception: %s", [[e description] UTF8String]);
+    }
+}
+
+__attribute__((constructor(3)))
+static void dst_foundation_swizzle_ctor(void) {
+    dst_ensure_log();
+    LOGD("=== applying Foundation swizzle (cluster_token injection) ===");
+    dst_swizzle_foundation();
+}
 
