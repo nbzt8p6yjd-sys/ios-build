@@ -42,6 +42,7 @@
 #include <sys/stat.h>
 
 #include <Foundation/Foundation.h>
+#include <objc/runtime.h>
 #include <UIKit/UIKit.h>
 #include <Security/Security.h>
 
