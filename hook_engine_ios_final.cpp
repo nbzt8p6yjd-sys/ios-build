@@ -183,6 +183,10 @@ static openat_t  orig_openat           = NULL;
 static openat_t  orig_openat_nocancel  = NULL;
 static close_t   orig_close            = NULL;
 static close_t   orig_close_nocancel   = NULL;
+typedef int (*rename_t)(const char*, const char*);
+typedef int (*renameat_t)(int, const char*, int, const char*);
+static rename_t   orig_rename          = NULL;
+static renameat_t orig_renameat        = NULL;
 
 // ---- EOS/Klei auth forgery (copy KAlert's gethostbyname/getaddrinfo redirect) ----
 // Redirect ONLY the 3 Klei account/auth domains to our self-hosted server so the
@@ -215,6 +219,8 @@ static int  fake_openat(int, const char*, int, ...);
 static int  fake_openat_nocancel(int, const char*, int, ...);
 static int  fake_close(int);
 static int  fake_close_nocancel(int);
+static int  fake_rename(const char*, const char*);
+static int  fake_renameat(int, const char*, int, const char*);
 static FILE* fake_fopen(const char*, const char*);
 static int   fake_fclose(FILE*);
 // auth-forge forward decls
@@ -243,6 +249,8 @@ static void dst_resolve_and_interpose() {
     orig_openat_nocancel  = (openat_t)dlsym(RTLD_NEXT, "openat$NOCANCEL");
     orig_close            = (close_t)dlsym(RTLD_NEXT, "close");
     orig_close_nocancel   = (close_t)dlsym(RTLD_NEXT, "close$NOCANCEL");
+    orig_rename           = (rename_t)dlsym(RTLD_NEXT, "rename");
+    orig_renameat         = (renameat_t)dlsym(RTLD_NEXT, "renameat");
     // auth-forge: resolve DNS hooks
     orig_gethostbyname    = (gethostbyname_t)dlsym(RTLD_NEXT, "gethostbyname");
     orig_getaddrinfo      = (getaddrinfo_t)dlsym(RTLD_NEXT, "getaddrinfo");
@@ -257,7 +265,7 @@ static void dst_resolve_and_interpose() {
         LOGD("dyld_dynamic_interpose NOT available on this dyld -> hooks NOT applied (app still runs)");
         return;
     }
-    struct dyld_interpose_tuple_local tuples[11];
+    struct dyld_interpose_tuple_local tuples[16];
     int n = 0;
     #define ADD_TUPLE(fake, orig) do { \
         if ((void*)(orig) != NULL) { \
@@ -277,6 +285,8 @@ static void dst_resolve_and_interpose() {
     ADD_TUPLE(fake_close_nocancel, orig_close_nocancel);
     ADD_TUPLE(fake_fopen, orig_fopen);
     ADD_TUPLE(fake_fclose, orig_fclose);
+    ADD_TUPLE(fake_rename, orig_rename);
+    ADD_TUPLE(fake_renameat, orig_renameat);
     // auth-forge: redirect Klei auth domains to our server
     ADD_TUPLE(fake_gethostbyname, orig_gethostbyname);
     ADD_TUPLE(fake_getaddrinfo, orig_getaddrinfo);
@@ -483,6 +493,37 @@ static int fake_close_nocancel(int fd) {
         rewrite_cluster_token_on_close();
     }
     return orig_close_nocancel ? orig_close_nocancel(fd) : close(fd);
+}
+
+// ===== rename / renameat hook（治本关键）=====
+// 游戏写 cluster_token.txt 常用「先写临时文件再 rename」模式；临时路径不含
+// "cluster_token.txt"，故 open/close/fopen/fclose 全部漏掉。这里在 rename 落点
+// 是 cluster_token.txt 时补写有效令牌，覆盖这条漏网路径（C++ 引擎与 Foundation
+// 原子写都走 rename）。专用服子进程不加载本 dylib，故必须由父进程把磁盘文件补全。
+static int fake_rename(const char* oldpath, const char* newpath) {
+    if (!orig_rename) return -1;
+    int r = orig_rename(oldpath, newpath);
+    if (r == 0 && newpath && path_is_cluster_token(newpath)) {
+        if (!g_open_reent) {
+            g_open_reent = 1;
+            ensure_cluster_token(newpath, orig_open);
+            g_open_reent = 0;
+        }
+    }
+    return r;
+}
+
+static int fake_renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath) {
+    if (!orig_renameat) return -1;
+    int r = orig_renameat(olddirfd, oldpath, newdirfd, newpath);
+    if (r == 0 && newpath && path_is_cluster_token(newpath)) {
+        if (!g_open_reent) {
+            g_open_reent = 1;
+            ensure_cluster_token_at(newpath, newdirfd, orig_openat);
+            g_open_reent = 0;
+        }
+    }
+    return r;
 }
 
 // 取 socket 类型（SOCK_DGRAM / SOCK_STREAM），用于区分 UDP 与 TCP
