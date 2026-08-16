@@ -254,6 +254,13 @@ static void dst_resolve_and_interpose() {
     // auth-forge: resolve DNS hooks
     orig_gethostbyname    = (gethostbyname_t)dlsym(RTLD_NEXT, "gethostbyname");
     orig_getaddrinfo      = (getaddrinfo_t)dlsym(RTLD_NEXT, "getaddrinfo");
+    // C-stdio 写路径：直接取标准库实现地址。
+    // 之前漏了这两行赋值 -> orig_fopen/orig_fclose 恒为 NULL -> fake_fopen/fake_fclose
+    // 因 ADD_TUPLE 跳过 NULL 而从未 interpose -> 游戏用 fopen 写 cluster_token.txt 时
+    // 完全绕过 hook -> 落盘空 -> 专用服 instance_2 读到空 -> 建房卡死。这是此前
+    // "重装最新包仍卡" 的真正根因（dylib 加载了、hook 应用了，但 fopen 根本没被 hook）。
+    orig_fopen  = (fopen_t)fopen;
+    orig_fclose = (fclose_t)fclose;
     dst_ensure_log();
     LOGD("originals resolved: connect=%p sendto=%p bind=%p open=%p openat=%p close=%p",
          (void*)orig_connect, (void*)orig_sendto, (void*)orig_bind,
@@ -308,6 +315,14 @@ static int g_token_inject_log = 0;
 static int path_is_cluster_token(const char* path) {
     if (!path) return 0;
     return strstr(path, "cluster_token.txt") != NULL;
+}
+
+// 诊断：记录游戏对 cluster_token.txt 用哪个文件 API 操作（定位空文件根因用）
+static int g_file_diag = 0;
+static void diag_file_op(const char* func, const char* path, const char* extra) {
+    if (!path_is_cluster_token(path)) return;
+    if (g_file_diag++ < 20)
+        LOGD("[DIAG-FILE] %s path=%s %s", func ? func : "?", path ? path : "(null)", extra ? extra : "");
 }
 
 // 判定这是「读取」打开（需要注入兜底）：纯写(O_WRONLY)与重建截断(O_RDWR|O_TRUNC)排除，
@@ -430,6 +445,7 @@ static void rewrite_cluster_token_on_close() {
 
 static int fake_open(const char* path, int flags, ...) {
     mode_t mode = 0; EXTRACT_MODE(flags, mode);
+    diag_file_op("open", path, NULL);
     if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
         g_open_reent = 1;
         ensure_cluster_token(path, orig_open);
@@ -455,6 +471,7 @@ static int fake_open_nocancel(const char* path, int flags, ...) {
 
 static int fake_openat(int dirfd, const char* path, int flags, ...) {
     mode_t mode = 0; EXTRACT_MODE(flags, mode);
+    diag_file_op("openat", path, NULL);
     if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
         g_open_reent = 1;
         ensure_cluster_token_at(path, dirfd, orig_openat);
@@ -501,6 +518,7 @@ static int fake_close_nocancel(int fd) {
 // 是 cluster_token.txt 时补写有效令牌，覆盖这条漏网路径（C++ 引擎与 Foundation
 // 原子写都走 rename）。专用服子进程不加载本 dylib，故必须由父进程把磁盘文件补全。
 static int fake_rename(const char* oldpath, const char* newpath) {
+    diag_file_op("rename", newpath, NULL);
     if (!orig_rename) return -1;
     int r = orig_rename(oldpath, newpath);
     if (r == 0 && newpath && path_is_cluster_token(newpath)) {
@@ -750,6 +768,7 @@ static void iosvision_init() {
 static FILE* g_tok_wfile = NULL;   // 与 POSIX 的 g_tok_wfd(int) 区分，避免类型混淆
 
 static FILE* fake_fopen(const char* path, const char* mode) {
+    diag_file_op("fopen", path, mode);
     FILE* f = orig_fopen ? orig_fopen(path, mode) : fopen(path, mode);
     if (f && !g_open_reent && path && path_is_cluster_token(path) && mode) {
         // 仅记录写模式（w/a/+），只读不清空
