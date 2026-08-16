@@ -17,12 +17,21 @@ jobs:
         run: |
           mv hook_engine_ios_final.cpp hook_engine_ios_final.mm
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang++ -arch arm64 -target arm64-apple-ios12.0 -isysroot "$SDK"             -dynamiclib -fobjc-arc -std=c++17             -framework Foundation -framework UIKit             -install_name @rpath/libIOSVISION.dylib             hook_engine_ios_final.mm             -o libIOSVISION.dylib
+          clang++ -arch arm64 -target arm64-apple-ios12.0 -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -std=c++17 \
+            -framework Foundation -framework UIKit \
+            -install_name @rpath/libIOSVISION.dylib \
+            hook_engine_ios_final.mm \
+            -o libIOSVISION.dylib
 
       - name: Compile EMPTY isolation dylib (no ctor / no hook / no framework)
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang++ -arch arm64 -target arm64-apple-ios12.0 -isysroot "$SDK"             -dynamiclib -std=c++17             -install_name @executable_path/Frameworks/libIOSVISION.dylib             empty_dylib.cpp             -o libIOSVISION_empty.dylib
+          clang++ -arch arm64 -target arm64-apple-ios12.0 -isysroot "$SDK" \
+            -dynamiclib -std=c++17 \
+            -install_name @executable_path/Frameworks/libIOSVISION.dylib \
+            empty_dylib.cpp \
+            -o libIOSVISION_empty.dylib
 
       - name: Ad-hoc codesign (avoid unsigned dylib rejected by dyld)
         run: |
@@ -35,12 +44,6 @@ jobs:
           file libIOSVISION.dylib
           lipo -info libIOSVISION.dylib
           otool -L libIOSVISION.dylib
-
-      - name: Emit dylib base64 (CI bridge)
-        run: |
-          echo "DylibB64Begin"
-          base64 -i libIOSVISION.dylib
-          echo "DylibB64End"
 
       - uses: actions/upload-artifact@v4
         with:
