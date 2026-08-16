@@ -262,9 +262,10 @@ static void dst_resolve_and_interpose() {
     orig_fopen  = (fopen_t)fopen;
     orig_fclose = (fclose_t)fclose;
     dst_ensure_log();
-    LOGD("originals resolved: connect=%p sendto=%p bind=%p open=%p openat=%p close=%p",
+    LOGD("originals resolved: connect=%p sendto=%p bind=%p open=%p openat=%p close=%p fopen=%p fclose=%p",
          (void*)orig_connect, (void*)orig_sendto, (void*)orig_bind,
-         (void*)orig_open, (void*)orig_openat, (void*)orig_close);
+         (void*)orig_open, (void*)orig_openat, (void*)orig_close,
+         (void*)orig_fopen, (void*)orig_fclose);
 
     dyld_dynamic_interpose_fn dyn_interpose =
         (dyld_dynamic_interpose_fn)dlsym(RTLD_DEFAULT, "dyld_dynamic_interpose");
@@ -768,6 +769,10 @@ static void iosvision_init() {
 static FILE* g_tok_wfile = NULL;   // 与 POSIX 的 g_tok_wfd(int) 区分，避免类型混淆
 
 static FILE* fake_fopen(const char* path, const char* mode) {
+    // 无条件诊断：记录所有 fopen 调用（不限 cluster_token），用于定位游戏真实用哪个 API
+    static int g_fopen_diag_count = 0;
+    if (g_fopen_diag_count++ < 30)
+        LOGD("[DIAG-FOPEN] %s mode=%s", path ? path : "(null)", mode ? mode : "(null)");
     diag_file_op("fopen", path, mode);
     FILE* f = orig_fopen ? orig_fopen(path, mode) : fopen(path, mode);
     if (f && !g_open_reent && path && path_is_cluster_token(path) && mode) {
