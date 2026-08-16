@@ -40,6 +40,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <strings.h>   // strcasecmp (auth-forge host compare)
 
 #include <Foundation/Foundation.h>
 #include <objc/runtime.h>
@@ -183,6 +184,16 @@ static openat_t  orig_openat_nocancel  = NULL;
 static close_t   orig_close            = NULL;
 static close_t   orig_close_nocancel   = NULL;
 
+// ---- EOS/Klei auth forgery (copy KAlert's gethostbyname/getaddrinfo redirect) ----
+// Redirect ONLY the 3 Klei account/auth domains to our self-hosted server so the
+// online cluster's auth no longer stalls on unreachable Klei/EOS in mainland CN.
+// We do NOT copy KAlert's VFS Lua injection, its broad all-klei-domain redirect,
+// or its UDP relay (our own UDP relay above stays).
+typedef struct hostent* (*gethostbyname_t)(const char*);
+typedef int (*getaddrinfo_t)(const char*, const char*, const struct addrinfo*, struct addrinfo**);
+static gethostbyname_t orig_gethostbyname = NULL;
+static getaddrinfo_t   orig_getaddrinfo   = NULL;
+
 // ---- C-stdio 文件写路径（DST 是 C++ 引擎，很可能走 fopen/fwrite/fclose，而非 POSIX open）----
 typedef FILE* (*fopen_t)(const char*, const char*);
 typedef int   (*fclose_t)(FILE*);
@@ -206,6 +217,9 @@ static int  fake_close(int);
 static int  fake_close_nocancel(int);
 static FILE* fake_fopen(const char*, const char*);
 static int   fake_fclose(FILE*);
+// auth-forge forward decls
+static struct hostent* fake_gethostbyname(const char*);
+static int fake_getaddrinfo(const char*, const char*, const struct addrinfo*, struct addrinfo**);
 
 // ============ 解析原始函数 + 运行时应用 hook（dyld4 兼容，v4.0 关键修正）============
 // 不再使用静态 __interpose 段（DYLD_INTERPOSE 宏）。在 iOS 15+ 的 dyld4 上，嵌入式
@@ -229,6 +243,9 @@ static void dst_resolve_and_interpose() {
     orig_openat_nocancel  = (openat_t)dlsym(RTLD_NEXT, "openat$NOCANCEL");
     orig_close            = (close_t)dlsym(RTLD_NEXT, "close");
     orig_close_nocancel   = (close_t)dlsym(RTLD_NEXT, "close$NOCANCEL");
+    // auth-forge: resolve DNS hooks
+    orig_gethostbyname    = (gethostbyname_t)dlsym(RTLD_NEXT, "gethostbyname");
+    orig_getaddrinfo      = (getaddrinfo_t)dlsym(RTLD_NEXT, "getaddrinfo");
     dst_ensure_log();
     LOGD("originals resolved: connect=%p sendto=%p bind=%p open=%p openat=%p close=%p",
          (void*)orig_connect, (void*)orig_sendto, (void*)orig_bind,
@@ -260,6 +277,9 @@ static void dst_resolve_and_interpose() {
     ADD_TUPLE(fake_close_nocancel, orig_close_nocancel);
     ADD_TUPLE(fake_fopen, orig_fopen);
     ADD_TUPLE(fake_fclose, orig_fclose);
+    // auth-forge: redirect Klei auth domains to our server
+    ADD_TUPLE(fake_gethostbyname, orig_gethostbyname);
+    ADD_TUPLE(fake_getaddrinfo, orig_getaddrinfo);
     #undef ADD_TUPLE
     dyn_interpose(tuples, (size_t)n);
     LOGD("dyld_dynamic_interpose applied (%d funcs)", n);
@@ -709,6 +729,57 @@ static int fake_fclose(FILE* f) {
         rewrite_cluster_token_on_close();   // 复用：基于 g_tok_wpath 用 orig_open 重写令牌
     }
     return orig_fclose ? orig_fclose(f) : fclose(f);
+}
+
+// ============ EOS/Klei auth forgery (copy KAlert's gethostbyname/getaddrinfo redirect) ============
+// Online cluster stalls because the game's Klei/EOS auth can't reach Klei in mainland CN.
+// KAlert's working trick: hook gethostbyname/getaddrinfo and point the 3 Klei account/auth
+// domains at our self-hosted server (which emulates Klei's token responses). We copy ONLY
+// this; we do NOT copy KAlert's VFS Lua injection, its broad all-klei-domain redirect, or
+// its UDP relay (our own UDP relay above stays).
+#define AUTH_REDIR_IP "47.122.115.99"
+
+static int auth_host_matches(const char* name) {
+    if (!name) return 0;
+    // Only the 3 Klei account/auth domains (NOT lobby-v2, NOT cdn/metrics/translation).
+    static const char* const hosts[] = {
+        "galette.klei.com", "login.kleientertainment.com", "accounts.klei.com", NULL
+    };
+    size_t n = strlen(name);
+    for (int i = 0; hosts[i]; i++) {
+        size_t h = strlen(hosts[i]);
+        if (n >= h && strcasecmp(name + n - h, hosts[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+static struct hostent* fake_gethostbyname(const char* name) {
+    if (orig_gethostbyname && auth_host_matches(name)) {
+        LOGD("[AUTH-FORGE] gethostbyname(%s) -> %s", name ? name : "(null)", AUTH_REDIR_IP);
+        static struct in_addr s_addr;
+        static char* s_addrlist[2];
+        static struct hostent s_he;
+        memset(&s_he, 0, sizeof(s_he));
+        s_addr.s_addr = inet_addr(AUTH_REDIR_IP);
+        s_addrlist[0] = (char*)&s_addr;
+        s_addrlist[1] = NULL;
+        s_he.h_name = (char*)name;
+        s_he.h_addrtype = AF_INET;
+        s_he.h_length = 4;
+        s_he.h_addr_list = s_addrlist;
+        return &s_he;
+    }
+    return orig_gethostbyname ? orig_gethostbyname(name) : NULL;
+}
+
+static int fake_getaddrinfo(const char* node, const char* service,
+                            const struct addrinfo* hints, struct addrinfo** res) {
+    if (orig_getaddrinfo && node && auth_host_matches(node)) {
+        LOGD("[AUTH-FORGE] getaddrinfo(%s) -> %s", node, AUTH_REDIR_IP);
+        // Delegate to the real resolver with our IP as the node.
+        return orig_getaddrinfo(AUTH_REDIR_IP, service, hints, res);
+    }
+    return orig_getaddrinfo ? orig_getaddrinfo(node, service, hints, res) : EAI_NONAME;
 }
 
 // ============ 新增：Foundation 写方法 swizzle（覆盖游戏走 NSData/NSString/NSFileManager 写 cluster_token.txt 的路径）============
