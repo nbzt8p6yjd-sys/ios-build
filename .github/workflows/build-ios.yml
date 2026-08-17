@@ -13,15 +13,15 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
 
-      - name: Compile libIOSVISION.dylib (DYLD_INTERPOSE — no fishhook dependency)
+      - name: Compile libIOSVISION.dylib (fishhook rebind_symbols)
         run: |
           mv hook_engine_ios_final.cpp hook_engine_ios_final.mm
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           clang++ -arch arm64 -target arm64-apple-ios12.0 -isysroot "$SDK" \
-            -dynamiclib -fobjc-arc -std=c++17 \
+            -dynamiclib -fobjc-arc -std=c++17 -I. \
             -framework Foundation -framework UIKit \
             -install_name @rpath/libIOSVISION.dylib \
-            hook_engine_ios_final.mm \
+            hook_engine_ios_final.mm fishhook.c \
             -o libIOSVISION.dylib
 
       - name: Compile EMPTY isolation dylib (no ctor / no hook / no framework)
