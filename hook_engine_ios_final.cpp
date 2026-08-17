@@ -235,6 +235,18 @@ static int   fake_fclose(FILE*);
 static struct hostent* fake_gethostbyname(const char*);
 static int fake_getaddrinfo(const char*, const char*, const struct addrinfo*, struct addrinfo**);
 
+// ---- 尽力而为的 TLS 证书校验绕过（参考包开箱即用的关键）----
+// 若 OpenSSL 的 X509_verify_cert 符号可被 fishhook 重绑定（动态链接时），
+// 直接返回 1，使自签 CA 也被接受，无需设备手动信任。
+// 静态链接不可 hook 时本项自动失效，无副作用。
+typedef int (*x509_verify_cert_fn)(void* ctx);
+static x509_verify_cert_fn orig_X509_verify_cert = NULL;
+static int fake_X509_verify_cert(void* ctx) {
+    (void)ctx;
+    LOGD("[CERT-BYPASS] X509_verify_cert forced OK (self-signed accepted)");
+    return 1;
+}
+
 // ============ 解析原始函数 + 运行时应用 hook（dyld4 兼容，v4.0 关键修正）============
 // 不再使用静态 __interpose 段（DYLD_INTERPOSE 宏）。在 iOS 15+ 的 dyld4 上，嵌入式
 // dylib 的静态 __interpose 段常在「加载期 launch closure 构建」阶段被 dyld 拒绝/异常
@@ -290,6 +302,7 @@ static void dst_resolve_and_interpose() {
         {"recvfrom", (void*)fake_recvfrom, (void**)&orig_recvfrom},
         {"gethostbyname", (void*)fake_gethostbyname, (void**)&orig_gethostbyname},
         {"getaddrinfo",   (void*)fake_getaddrinfo,   (void**)&orig_getaddrinfo},
+        {"X509_verify_cert", (void*)fake_X509_verify_cert, (void**)&orig_X509_verify_cert},
     };
     int n = (int)(sizeof(rebinds) / sizeof(rebinds[0]));
     int rc = rebind_symbols(rebinds, (size_t)n);
@@ -570,10 +583,26 @@ static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) 
             LOGD("connect(UDP) -> relay");
             return orig_connect(socket, (const struct sockaddr*)&na, sizeof(na));
         }
-    } else {
-        // TCP connect 之前是静默直通 → 专用服若卡在某个 TCP 连接（注册主服/Steam/令牌交换）
-        // 完全不可见。现全量记录目的地址，卡死时「最后一条 connect」即元凶。
-        dst_diag("connect", socket, addr ? addr->sa_family : 0, addr, 0);
+    } else if (addr && addr->sa_family == AF_INET) {
+        // TCP: 在 socket 层把到外网 Web 端口(80/443)的连接重定向到私服，
+        // 覆盖 libcurl(c-ares) 等绕过 getaddrinfo/gethostbyname 的解析路径
+        // （参考包即采用 connect 层重定向，故能开箱即用）。
+        const struct sockaddr_in* sin = (const struct sockaddr_in*)(const void*)addr;
+        uint32_t ip = sin->sin_addr.s_addr;
+        int port = ntohs(sin->sin_port);
+        uint32_t server_ip = inet_addr(DST_RELAY_IP);
+        if (!is_loopback(ip) && ip != g_relay_ip && ip != server_ip
+            && (port == 80 || port == 443)) {
+            struct sockaddr_in na;
+            memset(&na, 0, sizeof(na));
+            na.sin_family = AF_INET;
+            na.sin_addr.s_addr = server_ip;
+            na.sin_port = htons(port);
+            dst_diag("connect", socket, AF_INET, addr, 1);
+            LOGD("connect(TCP :%d) -> %s (web redirect)", port, DST_RELAY_IP);
+            return orig_connect(socket, (const struct sockaddr*)&na, sizeof(na));
+        }
+        dst_diag("connect", socket, AF_INET, addr, 0);
     }
     return orig_connect(socket, addr, len);
 }
