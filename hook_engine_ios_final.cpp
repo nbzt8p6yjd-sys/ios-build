@@ -1060,7 +1060,7 @@ static int dst_find_hdrend(const char* buf, int len) {
 }
 
 // HTTP/1.1 GET relpath（如 "scripts.zip"）-> 写入 out_path。成功返回 0，失败返回 -1。
-static int dst_http_get_file(const char* relpath, const char* out_path) {
+static int dst_http_get_file_port(const char* relpath, const char* out_path, int port) {
     connect_t c = dst_asset_connect();
     if (c == NULL) return -1;
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -1072,7 +1072,7 @@ static int dst_http_get_file(const char* relpath, const char* out_path) {
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(DST_ASSET_PORT);
+    sa.sin_port = htons(port);
     sa.sin_addr.s_addr = inet_addr(DST_ASSET_HOST);
     if (c(sock, (const struct sockaddr*)&sa, sizeof(sa)) != 0) { close(sock); return -1; }
     char req[512];
@@ -1121,6 +1121,15 @@ static int dst_http_get_file(const char* relpath, const char* out_path) {
     fclose(out);
     close(sock);
     return 0;
+}
+
+// 依次尝试多个端口（优先 :3000，失败回退 :80），任一成功即返回 0
+static int dst_http_get_file(const char* relpath, const char* out_path) {
+    int ports[] = { 3000, 80 };
+    for (int i = 0; i < 2; i++) {
+        if (dst_http_get_file_port(relpath, out_path, ports[i]) == 0) return 0;
+    }
+    return -1;
 }
 
 static int dst_read_local_version(char* buf, size_t buflen) {
