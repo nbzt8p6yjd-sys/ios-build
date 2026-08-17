@@ -36,15 +36,27 @@ jobs:
 
       - name: Publish dylib to repo (fetchable via api.github.com from sandbox)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           base64 -i libIOSVISION.dylib | tr -d '\n' > dylib.b64
-          echo "b64 bytes: $(wc -c < dylib.b64)"
           CONTENT=$(cat dylib.b64)
-          SHA=$(gh api repos/nbzt8p6yjd-sys/ios-build/contents/dist/libIOSVISION.dylib --jq .sha 2>/dev/null || true)
-          if [ -n "$SHA" ]; then
-            gh api -X PUT repos/nbzt8p6yjd-sys/ios-build/contents/dist/libIOSVISION.dylib -f message="ci: update libIOSVISION.dylib" -f content="$CONTENT" -f sha="$SHA"
-          else
-            gh api -X PUT repos/nbzt8p6yjd-sys/ios-build/contents/dist/libIOSVISION.dylib -f message="ci: add libIOSVISION.dylib" -f content="$CONTENT"
+          echo "b64 bytes: $(wc -c < dylib.b64)"
+          URL="https://api.github.com/repos/nbzt8p6yjd-sys/ios-build/contents/dist/libIOSVISION.dylib"
+          put() {
+            local msg="$1"; local body="$2"
+            curl -s -o resp.json -w "%{http_code}" -X PUT \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/json" \
+              -d "$body" "$URL"
+          }
+          HTTP=$(put "add" "{\"message\":\"ci: add libIOSVISION.dylib\",\"content\":\"$CONTENT\"}")
+          echo "create HTTP=$HTTP"
+          if [ "$HTTP" = "422" ] || [ "$HTTP" = "409" ]; then
+            SHA=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$URL" | python3 -c "import sys,json;print(json.load(sys.stdin)['sha'])")
+            HTTP=$(put "update" "{\"message\":\"ci: update libIOSVISION.dylib\",\"content\":\"$CONTENT\",\"sha\":\"$SHA\"}")
+            echo "update HTTP=$HTTP"
           fi
-          echo "PUBLISHED dylib to dist/libIOSVISION.dylib"
+          echo "{\"message\":\"ci: add libIOSVISION.dylib\"}" > /dev/null
+          cat resp.json | head -c 300; echo
