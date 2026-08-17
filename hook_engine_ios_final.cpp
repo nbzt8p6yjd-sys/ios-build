@@ -884,7 +884,7 @@ static int auth_host_matches(const char* name) {
     if (!name) return 0;
     // Only the 3 Klei account/auth domains (NOT lobby-v2, NOT cdn/metrics/translation).
     static const char* const hosts[] = {
-        "galette.klei.com", "login.kleientertainment.com", "accounts.klei.com", NULL
+        "galette.klei.com", "login.kleientertainment.com", "accounts.klei.com", "lobby-v2.klei.com", NULL
     };
     size_t n = strlen(name);
     for (int i = 0; hosts[i]; i++) {
