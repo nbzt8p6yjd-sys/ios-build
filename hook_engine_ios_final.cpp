@@ -1029,3 +1029,201 @@ static void dst_foundation_swizzle_ctor(void) {
     dst_swizzle_foundation();
 }
 
+// ============ [DYNAMIC ASSET LOAD] 启动时从私服拉取 scripts.zip / images.zip 覆盖内置包 ============
+// 与参考包「运行期动态加载整包」同款思路：安装包只含兜底包，启动时经 HTTP 从私服下载
+// 最新整包覆盖内置 data/databundles/*，以后更新只改服务器文件、无需重打包 IPA。
+// 全部 fail-safe，绝不因下载失败而崩游戏：
+//  - 先拉极小 version.txt 比对本地缓存版本，仅版本变化才下载整包（正常启动只做 1 次小 GET）；
+//  - 用捕获的原始 orig_connect（不经 fishhook 重定向）直连服务器 :3000；
+//  - 整包下载有总时长预算（防拖慢启动被看门狗杀），超时/失败则保留内置兜底包；
+//  - 下载落盘到 Documents/dst_assets_cache 后用 PK 魔数校验，再 move 覆盖 bundle 文件，
+//    失败自动回滚到 .bak；任何异常均被 @try 吞掉。
+#include <time.h>
+#define DST_ASSET_HOST    "47.122.115.99"
+#define DST_ASSET_PORT    3000
+#define DST_ASSET_BASE    "/dst/"
+#define DST_ASSET_CONN_TO 8    // connect / 单 recv 超时（秒）
+#define DST_ASSET_BUDGET  18   // 整包下载总预算（秒，启动安全）
+#define DST_ASSET_VERFILE "dst_assets_version.txt"
+
+static connect_t dst_asset_connect(void) {
+    if (orig_connect) return orig_connect;
+    return (connect_t)dlsym(RTLD_NEXT, "connect");
+}
+
+// 在 [buf,len) 中查找 "\r\n\r\n"，返回其起始偏移；找不到返回 -1
+static int dst_find_hdrend(const char* buf, int len) {
+    for (int i = 0; i + 3 < len; i++) {
+        if (buf[i]=='\r' && buf[i+1]=='\n' && buf[i+2]=='\r' && buf[i+3]=='\n') return i;
+    }
+    return -1;
+}
+
+// HTTP/1.1 GET relpath（如 "scripts.zip"）-> 写入 out_path。成功返回 0，失败返回 -1。
+static int dst_http_get_file(const char* relpath, const char* out_path) {
+    connect_t c = dst_asset_connect();
+    if (c == NULL) return -1;
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    struct timeval tv;
+    tv.tv_sec = DST_ASSET_CONN_TO; tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(DST_ASSET_PORT);
+    sa.sin_addr.s_addr = inet_addr(DST_ASSET_HOST);
+    if (c(sock, (const struct sockaddr*)&sa, sizeof(sa)) != 0) { close(sock); return -1; }
+    char req[512];
+    int rl = snprintf(req, sizeof(req),
+        "GET %s%s HTTP/1.1\r\nHost: %s\r\nUser-Agent: DSTIOS/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        DST_ASSET_BASE, relpath, DST_ASSET_HOST);
+    if (send(sock, req, (size_t)rl, 0) <= 0) { close(sock); return -1; }
+
+    char buf[65536];
+    int total = 0;
+    int hdr_end = -1;
+    while (total < (int)sizeof(buf)) {                 // 收头（含可能的一部分正文）
+        int n = recv(sock, buf + total, sizeof(buf) - total, 0);
+        if (n <= 0) break;
+        total += n;
+        hdr_end = dst_find_hdrend(buf, total);
+        if (hdr_end >= 0) break;
+    }
+    if (hdr_end < 0) { close(sock); return -1; }
+    buf[hdr_end] = '\0';
+    if (strstr(buf, " 200 ") == NULL && strstr(buf, "200 OK") == NULL) { close(sock); return -1; }
+
+    // 解析 Content-Length，正文收齐即停（避免依赖 Connection: close 的尾部等待）
+    long content_len = -1;
+    char* cl = strcasestr(buf, "content-length:");
+    if (cl) content_len = (long)atoi(cl + 15);
+
+    FILE* out = fopen(out_path, "wb");
+    if (!out) { close(sock); return -1; }
+    int body_start = hdr_end + 4;
+    long body_total = 0;
+    if (body_start < total) {
+        long wb = (long)(total - body_start);
+        fwrite(buf + body_start, 1, (size_t)wb, out);
+        body_total += wb;
+    }
+
+    time_t deadline = time(NULL) + DST_ASSET_BUDGET;
+    while (content_len < 0 || body_total < content_len) {
+        int n = recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        fwrite(buf, 1, (size_t)n, out);
+        body_total += n;
+        if (time(NULL) > deadline) { fclose(out); close(sock); return -1; }
+    }
+    fclose(out);
+    close(sock);
+    return 0;
+}
+
+static int dst_read_local_version(char* buf, size_t buflen) {
+    buf[0] = 0;
+    @autoreleasepool {
+        NSString* p = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                        stringByAppendingPathComponent:@DST_ASSET_VERFILE];
+        FILE* f = fopen([p UTF8String], "r");
+        if (!f) return 0;
+        if (fgets(buf, (int)buflen, f) == NULL) { fclose(f); return 0; }
+        fclose(f);
+        size_t L = strlen(buf);
+        while (L > 0 && (buf[L-1]=='\n' || buf[L-1]=='\r')) buf[--L] = 0;
+        return 1;
+    }
+}
+static void dst_write_local_version(const char* v) {
+    @autoreleasepool {
+        NSString* p = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                        stringByAppendingPathComponent:@DST_ASSET_VERFILE];
+        FILE* f = fopen([p UTF8String], "w");
+        if (f) { fputs(v, f); fputc('\n', f); fclose(f); }
+    }
+}
+
+__attribute__((constructor(100)))
+static void dst_prefetch_assets(void) {
+    @try {
+        dst_ensure_log();
+        LOGD("=== dst_prefetch_assets: dynamic asset load (server pull) ===");
+        NSString* bundleDB = [[[NSBundle mainBundle] bundlePath]
+                               stringByAppendingPathComponent:@"data/databundles"];
+        NSString* cacheDir = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                               stringByAppendingPathComponent:@"dst_assets_cache"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:cacheDir
+                                      withIntermediateDirectories:YES attributes:nil error:nil];
+
+        // 1) 版本比对
+        char local_v[128]; local_v[0] = 0;
+        int has_local = dst_read_local_version(local_v, sizeof(local_v));
+        char server_v[128]; server_v[0] = 0;
+        NSString* vtmp = [cacheDir stringByAppendingPathComponent:@"version.tmp"];
+        if (dst_http_get_file("version.txt", [vtmp UTF8String]) == 0) {
+            FILE* f = fopen([vtmp UTF8String], "r");
+            if (f) {
+                if (fgets(server_v, sizeof(server_v), f)) {
+                    size_t L = strlen(server_v);
+                    while (L > 0 && (server_v[L-1]=='\n' || server_v[L-1]=='\r')) server_v[--L] = 0;
+                }
+                fclose(f);
+            }
+        }
+        if (server_v[0] == 0) {
+            LOGD("prefetch: version.txt 拉取失败（可能离线）-> 保留内置兜底包");
+            return;
+        }
+        if (has_local && strcmp(local_v, server_v) == 0) {
+            LOGD("prefetch: 版本 %s 已是最新 -> 跳过下载", server_v);
+            return;
+        }
+        LOGD("prefetch: 版本 local='%s' server='%s' -> 开始下载整包", local_v, server_v);
+
+        // 2) 逐个下载并覆盖 bundle
+        NSArray* assets = @[@"scripts.zip", @"images.zip"];
+        for (NSString* name in assets) {
+            @try {
+                NSString* tmp = [cacheDir stringByAppendingPathComponent:
+                                 [name stringByAppendingString:@".tmp"]];
+                if (dst_http_get_file([name UTF8String], [tmp UTF8String]) != 0) {
+                    LOGE("prefetch: 下载失败 %s", [name UTF8String]);
+                    continue;
+                }
+                // PK 魔数校验
+                unsigned char sig[4] = {0};
+                FILE* vf = fopen([tmp UTF8String], "rb");
+                int ok = (vf && fread(sig, 1, 4, vf) == 4);
+                if (vf) fclose(vf);
+                if (!ok || !(sig[0]=='P' && sig[1]=='K' && sig[2]==0x03 && sig[3]==0x04)) {
+                    LOGE("prefetch: %s 非合法 zip（魔数错误）-> 跳过", [name UTF8String]);
+                    [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+                    continue;
+                }
+                NSFileManager* fm = [NSFileManager defaultManager];
+                NSString* dest = [bundleDB stringByAppendingPathComponent:name];
+                NSString* bak  = [bundleDB stringByAppendingPathComponent:
+                                  [name stringByAppendingString:@".bak"]];
+                [fm removeItemAtPath:bak error:nil];
+                [fm moveItemAtPath:dest toPath:bak error:nil];
+                NSError* err = nil;
+                if (![fm moveItemAtPath:tmp toPath:dest error:&err]) {
+                    LOGE("prefetch: 覆盖 %s 失败: %s", [name UTF8String], [[err description] UTF8String]);
+                    [fm moveItemAtPath:bak toPath:dest error:nil];
+                    continue;
+                }
+                LOGD("prefetch: %s 已更新 -> %s", [name UTF8String], [dest UTF8String]);
+            } @catch (NSException* e) {
+                LOGE("prefetch 循环异常: %s", [[e description] UTF8String]);
+            }
+        }
+        dst_write_local_version(server_v);
+        LOGD("prefetch: 完成，本地版本=%s", server_v);
+    } @catch (NSException* e) {
+        LOGE("dst_prefetch_assets 异常: %s", [[e description] UTF8String]);
+    }
+}
+
