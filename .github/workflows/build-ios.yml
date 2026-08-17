@@ -1,4 +1,4 @@
-name: Build iOS Hook Dylib
+name: Build iOS Hook Dylib + Inject IPA
 
 on:
   push:
@@ -51,3 +51,37 @@ jobs:
           path: |
             libIOSVISION.dylib
             libIOSVISION_empty.dylib
+
+  # 可选：把解密 IPA 以 base.ipa 为名传到本仓库 Release 后，重跑本流程即可直接产出可装 IPA。
+  # 没有 base.ipa 时本 job 自动跳过（仅编 dylib），不影响上面的 build。
+  inject:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download dylib artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-dylibs
+          path: .
+
+      - name: Try fetch base IPA from release 'base'
+        id: base
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download base -R nbzt8p6yjd-sys/ios-build --pattern "base.ipa" -D . || echo "NO_BASE"
+
+      - name: Inject dylib + repackage IPA
+        if: steps.base.outcome == 'success'
+        run: |
+          pip3 install --quiet lief
+          python3 inject_dylib.py --ipa base.ipa --dylib libIOSVISION.dylib --out dst-private-final.ipa
+
+      - name: Upload final IPA
+        if: steps.base.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dst-private-final-ipa
+          path: dst-private-final.ipa
