@@ -46,6 +46,11 @@
 #include <objc/runtime.h>
 #include <UIKit/UIKit.h>
 #include <Security/Security.h>
+#include <mach-o/dyld.h>
+#include <mach/mach.h>
+#include <mach/arm/thread_status.h>
+#include <pthread.h>
+#include "fishhook.h"
 
 // ---- 中继配置（与 server/relay/relay_server.py 的 RELAY_BASE_PORT 对齐）----
 #define DST_RELAY_IP   "47.122.115.99"
@@ -122,7 +127,7 @@ __attribute__((constructor(1)))
 static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB LOADED (libIOSVISION v4.0 / dyld_dynamic_interpose) ===");
+    LOGD("=== DYLIB LOADED (libIOSVISION diag / fishhook rebind_symbols) ===");
     signal(SIGILL,  dst_signal_handler);
     signal(SIGSEGV, dst_signal_handler);
     signal(SIGBUS,  dst_signal_handler);
@@ -170,6 +175,7 @@ static void dst_diag(const char* tag, int fd, int fam, const struct sockaddr* ad
 typedef int (*connect_t)(int, const struct sockaddr*, socklen_t);
 typedef ssize_t (*sendto_t)(int, const void*, size_t, int, const struct sockaddr*, socklen_t);
 typedef int (*bind_t)(int, const struct sockaddr*, socklen_t);
+typedef ssize_t (*recvfrom_t)(int, void*, size_t, int, struct sockaddr*, socklen_t*);
 typedef int (*open_t)(const char*, int, ...);
 typedef int (*openat_t)(int, const char*, int, ...);
 typedef int (*close_t)(int);
@@ -177,6 +183,7 @@ typedef int (*close_t)(int);
 static connect_t orig_connect = NULL;
 static sendto_t  orig_sendto  = NULL;
 static bind_t    orig_bind    = NULL;
+static recvfrom_t orig_recvfrom = NULL;
 static open_t    orig_open             = NULL;
 static open_t    orig_open_nocancel    = NULL;
 static openat_t  orig_openat           = NULL;
@@ -213,6 +220,7 @@ static BOOL (*orig_NSMgr_createFile)(id, SEL, NSString*, NSData*, NSDictionary*)
 static int  fake_connect(int, const struct sockaddr*, socklen_t);
 static ssize_t fake_sendto(int, const void*, size_t, int, const struct sockaddr*, socklen_t);
 static int  fake_bind(int, const struct sockaddr*, socklen_t);
+static ssize_t fake_recvfrom(int, void*, size_t, int, struct sockaddr*, socklen_t*);
 static int  fake_open(const char*, int, ...);
 static int  fake_open_nocancel(const char*, int, ...);
 static int  fake_openat(int, const char*, int, ...);
@@ -243,6 +251,7 @@ static void dst_resolve_and_interpose() {
     orig_connect          = (connect_t)dlsym(RTLD_NEXT, "connect");
     orig_sendto           = (sendto_t)dlsym(RTLD_NEXT, "sendto");
     orig_bind             = (bind_t)dlsym(RTLD_NEXT, "bind");
+    orig_recvfrom         = (recvfrom_t)dlsym(RTLD_NEXT, "recvfrom");
     orig_open             = (open_t)dlsym(RTLD_NEXT, "open");
     orig_open_nocancel    = (open_t)dlsym(RTLD_NEXT, "open$NOCANCEL");
     orig_openat           = (openat_t)dlsym(RTLD_NEXT, "openat");
@@ -267,40 +276,24 @@ static void dst_resolve_and_interpose() {
          (void*)orig_open, (void*)orig_openat, (void*)orig_close,
          (void*)orig_fopen, (void*)orig_fclose);
 
-    dyld_dynamic_interpose_fn dyn_interpose =
-        (dyld_dynamic_interpose_fn)dlsym(RTLD_DEFAULT, "dyld_dynamic_interpose");
-    if (!dyn_interpose) {
-        LOGD("dyld_dynamic_interpose NOT available on this dyld -> hooks NOT applied (app still runs)");
-        return;
-    }
-    struct dyld_interpose_tuple_local tuples[16];
-    int n = 0;
-    #define ADD_TUPLE(fake, orig) do { \
-        if ((void*)(orig) != NULL) { \
-            tuples[n].replacement = (const void*)(unsigned long)(fake); \
-            tuples[n].replacee    = (const void*)(unsigned long)(orig); \
-            n++; \
-        } \
-    } while(0)
-    ADD_TUPLE(fake_connect, orig_connect);
-    ADD_TUPLE(fake_sendto, orig_sendto);
-    ADD_TUPLE(fake_bind, orig_bind);
-    ADD_TUPLE(fake_open, orig_open);
-    ADD_TUPLE(fake_open_nocancel, orig_open_nocancel);
-    ADD_TUPLE(fake_openat, orig_openat);
-    ADD_TUPLE(fake_openat_nocancel, orig_openat_nocancel);
-    ADD_TUPLE(fake_close, orig_close);
-    ADD_TUPLE(fake_close_nocancel, orig_close_nocancel);
-    ADD_TUPLE(fake_fopen, orig_fopen);
-    ADD_TUPLE(fake_fclose, orig_fclose);
-    ADD_TUPLE(fake_rename, orig_rename);
-    ADD_TUPLE(fake_renameat, orig_renameat);
-    // auth-forge: redirect Klei auth domains to our server
-    ADD_TUPLE(fake_gethostbyname, orig_gethostbyname);
-    ADD_TUPLE(fake_getaddrinfo, orig_getaddrinfo);
-    #undef ADD_TUPLE
-    dyn_interpose(tuples, (size_t)n);
-    LOGD("dyld_dynamic_interpose applied (%d funcs)", n);
+    // ------------------------------------------------------------------
+    // 用 facebook fishhook (rebind_symbols) 替代 dyld_dynamic_interpose。
+    // 真机实证：dyld_dynamic_interpose 在 arm64e 上静默 no-op（dst_hook.log 零 [DIAG]），
+    // 而 fishhook 能真正拦截（见 2026-08-14 成功托管）。诊断版额外 hook recvfrom，
+    // 并把 connect/sendto/bind/recvfrom 全量打出目的地址，定位专用服(instance_2)卡死点。
+    // 注意：本诊断版只 hook 网络+DNS 符号，不 hook 文件(open/close/fopen)，
+    // 以对齐此前 proven-working 的 fishhook 构建、避免 cluster_token 随机令牌回归。
+    struct rebinding rebinds[] = {
+        {"connect",  (void*)fake_connect,  (void**)&orig_connect},
+        {"sendto",   (void*)fake_sendto,   (void**)&orig_sendto},
+        {"bind",     (void*)fake_bind,     (void**)&orig_bind},
+        {"recvfrom", (void*)fake_recvfrom, (void**)&orig_recvfrom},
+        {"gethostbyname", (void*)fake_gethostbyname, (void**)&orig_gethostbyname},
+        {"getaddrinfo",   (void*)fake_getaddrinfo,   (void**)&orig_getaddrinfo},
+    };
+    int n = (int)(sizeof(rebinds) / sizeof(rebinds[0]));
+    int rc = rebind_symbols(rebinds, (size_t)n);
+    LOGD("fishhook rebind_symbols rc=%d (0=OK) funcs=%d", rc, n);
 }
 
 // ---- cluster_token.txt 空文件兜底（iOS 建房令牌校验，治本）----
@@ -568,7 +561,8 @@ static int rewrite_to_relay(const struct sockaddr* addr, struct sockaddr_in* na)
 
 static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
-    if (sock_type(socket) == SOCK_DGRAM) {
+    int st = sock_type(socket);
+    if (st == SOCK_DGRAM) {
         struct sockaddr_in na;
         int red = rewrite_to_relay(addr, &na);
         dst_diag("connect", socket, addr ? addr->sa_family : 0, addr, red);
@@ -576,6 +570,10 @@ static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) 
             LOGD("connect(UDP) -> relay");
             return orig_connect(socket, (const struct sockaddr*)&na, sizeof(na));
         }
+    } else {
+        // TCP connect 之前是静默直通 → 专用服若卡在某个 TCP 连接（注册主服/Steam/令牌交换）
+        // 完全不可见。现全量记录目的地址，卡死时「最后一条 connect」即元凶。
+        dst_diag("connect", socket, addr ? addr->sa_family : 0, addr, 0);
     }
     return orig_connect(socket, addr, len);
 }
@@ -624,16 +622,94 @@ static int fake_bind(int socket, const struct sockaddr* addr, socklen_t len) {
     return r;
 }
 
+// ---- recvfrom 诊断钩子（ENTRY/EXIT 成对）----
+// 卡死常因 recvfrom 永远收不到数据而阻塞：看到 "recvfrom ENTER fd=X" 之后没有对应
+// "EXIT"，即说明该线程卡在等数据；EXIT 后带实际来源地址，可看清在等谁。
+static int g_rf_cap = 0;
+static ssize_t fake_recvfrom(int socket, void* buffer, size_t length, int flags,
+                             struct sockaddr* addr, socklen_t* addr_len) {
+    if (g_rf_cap++ < 6000)
+        LOGD("[DIAG] recvfrom ENTER fd=%d", socket);
+    ssize_t r = orig_recvfrom(socket, buffer, length, flags, addr, addr_len);
+    if (g_rf_cap < 6000) {
+        if (r >= 0 && addr && addr_len) {
+            dst_diag("recvfrom", socket, addr->sa_family, addr, 0);
+        } else {
+            LOGD("[DIAG] recvfrom EXIT fd=%d r=%zd errno=%d", socket, r, errno);
+        }
+    }
+    return r;
+}
+
 static void dst_online_init() {
     dst_ensure_log();
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
-    LOGD("=== DST UDP relay init (relay=%s:%d, dyld_dynamic_interpose) ===", DST_RELAY_IP, DST_RELAY_PORT);
+    LOGD("=== DST UDP relay init (relay=%s:%d, fishhook) ===", DST_RELAY_IP, DST_RELAY_PORT);
     LOGD("=== DST UDP relay done ===");
 }
 
 __attribute__((constructor(100)))
 static void dst_online_ctor() {
     dst_online_init();
+}
+
+// ============ 看门狗：周期抓取所有线程 PC，精确定位卡死函数 ============
+// 专用服(instance_2)建房卡死可能是「非 socket 阻塞」(互斥锁/条件变量死锁、文件等待、
+// 线程互等)，这类卡死 connect/sendto/recvfrom 日志抓不到。看门狗每 5 秒用 Mach
+// task_threads + thread_get_state 读出每个线程的 PC，并解析其所在 dylib/二进制+偏移，
+// 直接显示「卡在哪个库/偏移」。建房转圈时看最后几次快照即知卡点。
+static void* dst_watchdog(void* arg) {
+    (void)arg;
+    int dumps = 0;
+    while (dumps < 40) {                 // 最多 40 次（约 200s）后停止，避免无限刷屏
+        sleep(5);
+        dumps++;
+        thread_act_array_t threads = NULL;
+        mach_msg_type_number_t count = 0;
+        kern_return_t kr = task_threads(mach_task_self(), &threads, &count);
+        if (kr != KERN_SUCCESS) { LOGD("[WD] task_threads failed kr=%d", (int)kr); continue; }
+        LOGD("[WD] === thread snapshot #%d (%d threads) ===", dumps, (int)count);
+        int nimg = (int)_dyld_image_count();
+        for (mach_msg_type_number_t i = 0; i < count; i++) {
+            arm_thread_state64_t state;
+            mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+            kr = thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&state, &sc);
+            if (kr != KERN_SUCCESS) { LOGD("[WD]  tid#%d get_state fail kr=%d", (int)i, (int)kr); continue; }
+            // pc 在 arm_thread_state64_t 中位于 x[29],fp,lr,sp 之后（uint64 索引 32）
+            uint64_t pc = ((uint64_t*)&state)[32];
+            char libbuf[320]; libbuf[0] = 0;
+            for (int j = 0; j < nimg; j++) {
+                const struct mach_header* h = _dyld_get_image_header(j);
+                if (!h) continue;
+                uint64_t base = (uint64_t)h + (uint64_t)_dyld_get_image_vmaddr_slide(j);
+                uint64_t nextbase = (j + 1 < nimg)
+                    ? (uint64_t)_dyld_get_image_header(j + 1) + (uint64_t)_dyld_get_image_vmaddr_slide(j + 1)
+                    : base + 0x100000000ULL;
+                if (pc >= base && pc < nextbase) {
+                    snprintf(libbuf, sizeof(libbuf), "%s +0x%llx",
+                             _dyld_get_image_name(j), (unsigned long long)(pc - base));
+                    break;
+                }
+            }
+            if (!libbuf[0]) snprintf(libbuf, sizeof(libbuf), "??? +0x%llx", (unsigned long long)pc);
+            LOGD("[WD]  #%d pc=%s", (int)i, libbuf);
+        }
+        if (threads) vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_act_t));
+    }
+    LOGD("[WD] watchdog finished");
+    return NULL;
+}
+
+__attribute__((constructor(150)))
+static void dst_watchdog_ctor() {
+    dst_ensure_log();
+    LOGD("=== DST watchdog starting (fishhook diag build) ===");
+    pthread_t t;
+    if (pthread_create(&t, NULL, dst_watchdog, NULL) != 0) {
+        LOGD("[WD] pthread_create failed");
+    } else {
+        pthread_detach(t);
+    }
 }
 
 // ============ 原有：皮肤解锁注入 (IOSVISION v6.1) ============
