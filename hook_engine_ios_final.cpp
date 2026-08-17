@@ -303,6 +303,14 @@ static void dst_resolve_and_interpose() {
         {"gethostbyname", (void*)fake_gethostbyname, (void**)&orig_gethostbyname},
         {"getaddrinfo",   (void*)fake_getaddrinfo,   (void**)&orig_getaddrinfo},
         {"X509_verify_cert", (void*)fake_X509_verify_cert, (void**)&orig_X509_verify_cert},
+        // 文件重定向：动态整包（scripts.zip/images.zip 读 -> Documents 副本）+ cluster_token 注入
+        {"open",            (void*)fake_open,            (void**)&orig_open},
+        {"open$NOCANCEL",   (void*)fake_open_nocancel,   (void**)&orig_open_nocancel},
+        {"openat",          (void*)fake_openat,          (void**)&orig_openat},
+        {"openat$NOCANCEL", (void*)fake_openat_nocancel, (void**)&orig_openat_nocancel},
+        {"fopen",           (void*)fake_fopen,           (void**)&orig_fopen},
+        {"rename",          (void*)fake_rename,          (void**)&orig_rename},
+        {"renameat",        (void*)fake_renameat,        (void**)&orig_renameat},
     };
     int n = (int)(sizeof(rebinds) / sizeof(rebinds[0]));
     int rc = rebind_symbols(rebinds, (size_t)n);
@@ -450,9 +458,49 @@ static void rewrite_cluster_token_on_close() {
     g_tok_wpath[0] = '\0';
 }
 
+// ---- 动态整包重定向：游戏读取 bundle 内 scripts.zip/images.zip 时，
+// 若 Documents/dst_assets_cache/ 下存在已下载副本，则重定向到该副本打开。
+// 这样即使 app bundle 只读（iOS 常态）也能用上服务器下发的整包
+// （参考包式动态加载，文件层实现，不依赖 bundle 可写）。
+static const char* g_dst_db_names[] = { "scripts.zip", "images.zip" };
+static char g_dst_redirect_buf[1024];
+
+static const char* dst_redirect_databundle(const char* path) {
+    if (!path) return path;
+    const char* base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    int hit = 0;
+    for (int i = 0; i < 2; i++) {
+        if (strcmp(base, g_dst_db_names[i]) == 0) { hit = 1; break; }
+    }
+    if (!hit) return path;
+    @autoreleasepool {
+        NSString* nm = [NSString stringWithUTF8String:base];
+        NSString* cache = [[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                             stringByAppendingPathComponent:@"dst_assets_cache"]
+                            stringByAppendingPathComponent:nm];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:cache]) {
+            const char* c = [cache UTF8String];
+            strncpy(g_dst_redirect_buf, c, sizeof(g_dst_redirect_buf) - 1);
+            g_dst_redirect_buf[sizeof(g_dst_redirect_buf) - 1] = '\0';
+            LOGD("databundle redirect: %s -> %s", path, g_dst_redirect_buf);
+            return g_dst_redirect_buf;
+        }
+    }
+    return path;
+}
+
 static int fake_open(const char* path, int flags, ...) {
     mode_t mode = 0; EXTRACT_MODE(flags, mode);
     diag_file_op("open", path, NULL);
+    if (!g_open_reent && open_is_read(flags)) {
+        const char* red = dst_redirect_databundle(path);
+        if (red != path) {
+            int rfd = orig_open ? orig_open(red, flags, mode) : open(red, flags, mode);
+            record_tok_write_fd(rfd, path, flags);
+            return rfd;
+        }
+    }
     if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
         g_open_reent = 1;
         ensure_cluster_token(path, orig_open);
@@ -466,6 +514,14 @@ static int fake_open(const char* path, int flags, ...) {
 static int fake_open_nocancel(const char* path, int flags, ...) {
     mode_t mode = 0; EXTRACT_MODE(flags, mode);
     open_t real = orig_open_nocancel ? orig_open_nocancel : orig_open;
+    if (!g_open_reent && open_is_read(flags)) {
+        const char* red = dst_redirect_databundle(path);
+        if (red != path) {
+            int rfd = real(red, flags, mode);
+            record_tok_write_fd(rfd, path, flags);
+            return rfd;
+        }
+    }
     if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
         g_open_reent = 1;
         ensure_cluster_token(path, real);
@@ -479,6 +535,14 @@ static int fake_open_nocancel(const char* path, int flags, ...) {
 static int fake_openat(int dirfd, const char* path, int flags, ...) {
     mode_t mode = 0; EXTRACT_MODE(flags, mode);
     diag_file_op("openat", path, NULL);
+    if (!g_open_reent && open_is_read(flags)) {
+        const char* red = dst_redirect_databundle(path);
+        if (red != path) {
+            int rfd = orig_open ? orig_open(red, flags, mode) : open(red, flags, mode);
+            record_tok_write_fd(rfd, path, flags);
+            return rfd;
+        }
+    }
     if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
         g_open_reent = 1;
         ensure_cluster_token_at(path, dirfd, orig_openat);
@@ -493,6 +557,14 @@ static int fake_openat(int dirfd, const char* path, int flags, ...) {
 static int fake_openat_nocancel(int dirfd, const char* path, int flags, ...) {
     mode_t mode = 0; EXTRACT_MODE(flags, mode);
     openat_t real = orig_openat_nocancel ? orig_openat_nocancel : orig_openat;
+    if (!g_open_reent && open_is_read(flags)) {
+        const char* red = dst_redirect_databundle(path);
+        if (red != path) {
+            int rfd = orig_open ? orig_open(red, flags, mode) : open(red, flags, mode);
+            record_tok_write_fd(rfd, path, flags);
+            return rfd;
+        }
+    }
     if (!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)) {
         g_open_reent = 1;
         ensure_cluster_token_at(path, dirfd, real);
@@ -879,6 +951,14 @@ static FILE* fake_fopen(const char* path, const char* mode) {
     if (g_fopen_diag_count++ < 30)
         LOGD("[DIAG-FOPEN] %s mode=%s", path ? path : "(null)", mode ? mode : "(null)");
     diag_file_op("fopen", path, mode);
+    // 动态整包重定向：只读打开 scripts.zip/images.zip 时改走 Documents 副本
+    if (!g_open_reent && mode && (mode[0] == 'r') && !strchr(mode, '+')) {
+        const char* red = dst_redirect_databundle(path);
+        if (red != path) {
+            FILE* rf = orig_fopen ? orig_fopen(red, mode) : fopen(red, mode);
+            return rf;
+        }
+    }
     FILE* f = orig_fopen ? orig_fopen(path, mode) : fopen(path, mode);
     if (f && !g_open_reent && path && path_is_cluster_token(path) && mode) {
         // 仅记录写模式（w/a/+），只读不清空
@@ -1042,8 +1122,8 @@ static void dst_foundation_swizzle_ctor(void) {
 #define DST_ASSET_HOST    "47.122.115.99"
 #define DST_ASSET_PORT    3000
 #define DST_ASSET_BASE    "/dst/"
-#define DST_ASSET_CONN_TO 8    // connect / 单 recv 超时（秒）
-#define DST_ASSET_BUDGET  18   // 整包下载总预算（秒，启动安全）
+#define DST_ASSET_CONN_TO 15   // 单 recv 超时（秒）；整包按块收，单块久等才判超时
+#define DST_ASSET_BUDGET  25   // 整包下载总预算（秒，启动安全；超时则保留内置兜底）
 #define DST_ASSET_VERFILE "dst_assets_version.txt"
 
 static connect_t dst_asset_connect(void) {
@@ -1120,6 +1200,10 @@ static int dst_http_get_file_port(const char* relpath, const char* out_path, int
     }
     fclose(out);
     close(sock);
+    if (content_len >= 0 && body_total < content_len) {
+        LOGE("prefetch: %s 下载截断 %ld/%ld -> 丢弃", relpath, body_total, content_len);
+        return -1;
+    }
     return 0;
 }
 
@@ -1220,7 +1304,7 @@ static void dst_prefetch_assets(void) {
                 [fm moveItemAtPath:dest toPath:bak error:nil];
                 NSError* err = nil;
                 if (![fm moveItemAtPath:tmp toPath:dest error:&err]) {
-                    LOGE("prefetch: 覆盖 %s 失败: %s", [name UTF8String], [[err description] UTF8String]);
+                    LOGD("prefetch: 覆盖 %s 失败(只读bundle, 由 open 重定向兜底): %s", [name UTF8String], [[err description] UTF8String]);
                     [fm moveItemAtPath:bak toPath:dest error:nil];
                     continue;
                 }
