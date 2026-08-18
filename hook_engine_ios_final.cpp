@@ -14,7 +14,9 @@
  *    → 白屏、零日志，无法诊断）。dyld_dynamic_interpose 不可用时软失败（记日志、不崩）。
  *    —— 这正是此前 fishhook(DYLD_INTERPOSE 静态段)在 1.3.0 上崩白屏的根因。
  *  - 游戏（DST）所有「非回环的外部 UDP」一律重写目的地址为我们的中继
- *    (47.122.115.99:12000)，由云端中继做 N-way 字节转发，实现 iPhone↔iPhone 跨网。
+ *    (47.122.115.99:12000..12999)，由云端中继做 N-way 字节转发，实现 iPhone↔iPhone 跨网。
+ *    房主出站 UDP 被重写到「该房间独立端口」（由 Lua 写入 Documents/ios_relay_port.txt），
+ *    从而实现多房间端口隔离、互不串扰。
  *  - 回环(127.0.0.0/8)UDP 不动  → 房主本机 client↔server 正常（本地建房不受影响）。
  *  - TCP(HTTPS 登录 / 其他)不动  → 我们的登录接口(47.122.115.99:3000)照常走，不被误伤。
  *  - 房主侧：其游戏服务器 bind(INADDR_ANY UDP) 时，主动向中继发一个 1 字节注册包，
@@ -53,6 +55,8 @@
 #include "fishhook.h"
 
 // ---- 中继配置（与 server/relay/relay_server.py 的 RELAY_BASE_PORT 对齐）----
+//  端口段 12000..12999：每房间按 roomId 派生独立端口（relay_port_for_room），
+//  dylib 通过 Documents/ios_relay_port.txt 读取房主当前房间端口（默认 12000）。
 #define DST_RELAY_IP   "47.122.115.99"
 #define DST_RELAY_PORT 12000
 
@@ -85,6 +89,31 @@ static int dst_is_authed(void) {
     g_authed_cache = authed;
     g_authed_at = now;
     return authed;
+}
+
+// ---- 房主建房端口（房间隔离）：Lua 把 /api/register 返回的端口写入
+//  Documents/ios_relay_port.txt，dylib 惰性读取（1s 缓存），把房主出站 UDP
+//  重写到「该房间独立中继端口」，实现多房间互不串扰。默认 12000（兼容旧单房间）。
+//  与 server/relay/relay_server.py 的 relay_port_for_room(roomId) 派生保持一致。
+static int g_relay_port_cache = -1;
+static time_t g_relay_port_at = 0;
+static int dst_relay_port(void) {
+    time_t now = time(NULL);
+    if (g_relay_port_cache > 0 && now - g_relay_port_at < 1) return g_relay_port_cache;
+    int p = DST_RELAY_PORT;
+    @autoreleasepool {
+        NSString* path = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                           stringByAppendingPathComponent:@"ios_relay_port.txt"];
+        FILE* f = fopen([path UTF8String], "r");
+        if (f) {
+            int v = 0;
+            if (fscanf(f, "%d", &v) == 1 && v >= 12000 && v <= 12999) p = v;
+            fclose(f);
+        }
+    }
+    g_relay_port_cache = p;
+    g_relay_port_at = now;
+    return p;
 }
 
 // ---- 文件日志（真机反馈用，写 Documents/dst_hook.log） ----
@@ -175,7 +204,9 @@ static int is_loopback(uint32_t ip_net) {
     return (ip & 0xFF000000u) == 0x7F000000u;   // 127.0.0.0/8
 }
 static int is_relay(uint32_t ip_net, int port) {
-    return ip_net == g_relay_ip && port == DST_RELAY_PORT;   // 二者皆网络序，直接比
+    // 整个 12000..12999 中继段都视为「已是中继」，避免自环。
+    // 端口由 roomId 派生（动态），故用范围匹配而非单一固定值。
+    return ip_net == g_relay_ip && port >= 12000 && port <= 12999;
 }
 
 // ---- 诊断日志（仅建房/联机排错用，限行数避免刷屏）----
@@ -698,7 +729,7 @@ static int rewrite_to_relay(const struct sockaddr* addr, struct sockaddr_in* na)
     if (is_relay(ip, port)) return 0;       // 已是中继：避免自环
     memcpy(na, sin, sizeof(*na));
     na->sin_addr.s_addr = g_relay_ip;
-    na->sin_port = htons(DST_RELAY_PORT);
+    na->sin_port = htons(dst_relay_port());   // 房主房间独立端口（文件读取）
     return 1;
 }
 
@@ -774,7 +805,7 @@ static int fake_bind(int socket, const struct sockaddr* addr, socklen_t len) {
             memset(&na, 0, sizeof(na));
             na.sin_family = AF_INET;
             na.sin_addr.s_addr = g_relay_ip;
-            na.sin_port = htons(DST_RELAY_PORT);
+            na.sin_port = htons(dst_relay_port());   // 房主房间独立端口（文件读取）
             const char probe = 0;
             ssize_t s = orig_sendto(socket, &probe, 1, 0,
                                     (const struct sockaddr*)&na, sizeof(na));
