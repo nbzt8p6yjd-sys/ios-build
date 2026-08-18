@@ -298,9 +298,9 @@ static void dst_resolve_and_interpose() {
          (void*)orig_open, (void*)orig_openat, (void*)orig_close,
          (void*)orig_fopen, (void*)orig_fclose);
 
-    // ---- 授权门控：必须在 rebind 之前用原始 connect 校验 token ----
-    dst_check_auth();
-    LOGD("auth gate applied: g_authed=%d (1=私有集成已激活, 0=原版/离线模式)", g_authed);
+    // 始终重定向模型（对齐参考包）：增强脚本动态拉取 + Klei 域名/UDP 始终重定向到私服；
+    // 授权门控在 Lua 层（IOSLobbyOnline/IOSAuthActivate）+ 服务端（/api/register 等校验 token）。
+    LOGD("always-redirect mode: networking hooks active unconditionally");
 
     // ------------------------------------------------------------------
     // 用 facebook fishhook (rebind_symbols) 替代 dyld_dynamic_interpose。
@@ -665,7 +665,7 @@ static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) 
         struct sockaddr_in na;
         int red = rewrite_to_relay(addr, &na);
         dst_diag("connect", socket, addr ? addr->sa_family : 0, addr, red);
-        if (g_authed && red) {
+        if (red) {
             LOGD("connect(UDP) -> relay");
             return orig_connect(socket, (const struct sockaddr*)&na, sizeof(na));
         }
@@ -677,7 +677,7 @@ static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) 
         uint32_t ip = sin->sin_addr.s_addr;
         int port = ntohs(sin->sin_port);
         uint32_t server_ip = inet_addr(DST_RELAY_IP);
-        if (g_authed && !is_loopback(ip) && ip != g_relay_ip && ip != server_ip
+        if (!is_loopback(ip) && ip != g_relay_ip && ip != server_ip
             && (port == 80 || port == 443)) {
             struct sockaddr_in na;
             memset(&na, 0, sizeof(na));
@@ -700,7 +700,7 @@ static ssize_t fake_sendto(int socket, const void* buffer, size_t length, int fl
         struct sockaddr_in na;
         int red = rewrite_to_relay(dest_addr, &na);
         dst_diag("sendto", socket, dest_addr ? dest_addr->sa_family : 0, dest_addr, red);
-        if (g_authed && red) {
+        if (red) {
             return orig_sendto(socket, buffer, length, flags,
                                (const struct sockaddr*)&na, sizeof(na));
         }
@@ -722,8 +722,7 @@ static int fake_bind(int socket, const struct sockaddr* addr, socklen_t len) {
         dst_diag("bind", socket, fam, addr, is_any);
         // 房主游戏服务器监听 0.0.0.0(UDP)：主动发 1 字节注册包到中继，
         // 让中继记录房主出口地址，加入者才能被转发过来（NAT 打洞）。
-        // 仅授权后激活（未授权不向 relay 注册，游戏 UDP 直连原服务器）。
-        if (g_authed && fam == AF_INET && is_any) {
+        if (fam == AF_INET && is_any) {
             struct sockaddr_in na;
             memset(&na, 0, sizeof(na));
             na.sin_family = AF_INET;
@@ -1019,7 +1018,7 @@ static int auth_host_matches(const char* name) {
 }
 
 static struct hostent* fake_gethostbyname(const char* name) {
-    if (g_authed && orig_gethostbyname && auth_host_matches(name)) {
+    if (orig_gethostbyname && auth_host_matches(name)) {
         LOGD("[AUTH-FORGE] gethostbyname(%s) -> %s", name ? name : "(null)", AUTH_REDIR_IP);
         static struct in_addr s_addr;
         static char* s_addrlist[2];
@@ -1039,7 +1038,7 @@ static struct hostent* fake_gethostbyname(const char* name) {
 
 static int fake_getaddrinfo(const char* node, const char* service,
                             const struct addrinfo* hints, struct addrinfo** res) {
-    if (g_authed && orig_getaddrinfo && node && auth_host_matches(node)) {
+    if (orig_getaddrinfo && node && auth_host_matches(node)) {
         LOGD("[AUTH-FORGE] getaddrinfo(%s) -> %s", node, AUTH_REDIR_IP);
         // Delegate to the real resolver with our IP as the node.
         return orig_getaddrinfo(AUTH_REDIR_IP, service, hints, res);
