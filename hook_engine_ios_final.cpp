@@ -323,7 +323,7 @@ static void dst_resolve_and_interpose() {
     // v10 门控模型（对齐参考包 _g_authed）：未授权 = 网络完全原版（离线单机/官方流程）；
     // 授权（Documents/ios_auth_token.txt 非空）= UDP->relay + Klei 域名->私服重定向。
     // 增强脚本/资源由后台线程动态拉取（constructor 不阻塞），ready.flag 配对落地。
-    LOGD("authed-redirect mode v10: network hooks gated by Documents/ios_auth_token.txt");
+    LOGD("authed-redirect mode v11: network hooks gated by Documents/ios_auth_token.txt");
 
     // ------------------------------------------------------------------
     // 用 facebook fishhook (rebind_symbols) 替代 dyld_dynamic_interpose。
@@ -1182,8 +1182,8 @@ static void dst_foundation_swizzle_ctor(void) {
 #define DST_ASSET_HOST    "47.122.115.99"
 #define DST_ASSET_PORT    3000
 #define DST_ASSET_BASE    "/dst/"
-#define DST_ASSET_CONN_TO 15   // 单 recv 超时（秒）；整包按块收，单块久等才判超时
-#define DST_ASSET_BUDGET  180  // 单整包下载总预算（秒）——后台线程无启动看门狗风险，放宽
+#define DST_ASSET_CONN_TO 120  // 单 recv 超时（秒）；游戏启动期解压 databundle 抢资源，移动网络慢，放宽避免误判
+#define DST_ASSET_BUDGET  1800 // 单整包下载总预算（秒）——后台线程无启动看门狗风险，充分放宽
 
 static connect_t dst_asset_connect(void) {
     if (orig_connect) return orig_connect;
@@ -1198,8 +1198,12 @@ static int dst_find_hdrend(const char* buf, int len) {
     return -1;
 }
 
-// HTTP/1.1 GET relpath（如 "scripts.zip"）-> 写入 out_path。成功返回 0，失败返回 -1。
-static int dst_http_get_file_port(const char* relpath, const char* out_path, int port) {
+// HTTP/1.1 GET relpath（如 "scripts.zip"）写入 out_path。
+// resume_from>0 时发送 Range 请求从上次进度继续；支持连接错误/超时的单次续传重试
+// （每次重试仍从上次已落盘进度继续，不重下）。成功返回 0，失败返回 -1。
+// 注意：本函数不删除 out_path；续传语义由调用方（worker）保留临时文件实现。
+static int dst_http_get_file_port(const char* relpath, const char* out_path,
+                                  int port, long resume_from) {
     connect_t c = dst_asset_connect();
     if (c == NULL) return -1;
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -1215,9 +1219,17 @@ static int dst_http_get_file_port(const char* relpath, const char* out_path, int
     sa.sin_addr.s_addr = inet_addr(DST_ASSET_HOST);
     if (c(sock, (const struct sockaddr*)&sa, sizeof(sa)) != 0) { close(sock); return -1; }
     char req[512];
-    int rl = snprintf(req, sizeof(req),
-        "GET %s%s HTTP/1.1\r\nHost: %s\r\nUser-Agent: DSTIOS/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-        DST_ASSET_BASE, relpath, DST_ASSET_HOST);
+    int rl;
+    if (resume_from > 0) {
+        rl = snprintf(req, sizeof(req),
+            "GET %s%s HTTP/1.1\r\nHost: %s\r\nUser-Agent: DSTIOS/1.0\r\nAccept: */*\r\n"
+            "Range: bytes=%ld-\r\nConnection: close\r\n\r\n",
+            DST_ASSET_BASE, relpath, DST_ASSET_HOST, resume_from);
+    } else {
+        rl = snprintf(req, sizeof(req),
+            "GET %s%s HTTP/1.1\r\nHost: %s\r\nUser-Agent: DSTIOS/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            DST_ASSET_BASE, relpath, DST_ASSET_HOST);
+    }
     if (send(sock, req, (size_t)rl, 0) <= 0) { close(sock); return -1; }
 
     char buf[65536];
@@ -1232,17 +1244,21 @@ static int dst_http_get_file_port(const char* relpath, const char* out_path, int
     }
     if (hdr_end < 0) { close(sock); return -1; }
     buf[hdr_end] = '\0';
-    if (strstr(buf, " 200 ") == NULL && strstr(buf, "200 OK") == NULL) { close(sock); return -1; }
+    // 206（续传）/ 200（整包）均视为成功；416（range 越界）视为已完整
+    int code_ok = (strstr(buf, " 200 ") != NULL || strstr(buf, "200 OK") != NULL ||
+                   strstr(buf, " 206 ") != NULL || strstr(buf, "206 ") != NULL ||
+                   strstr(buf, " 416 ") != NULL);
+    if (!code_ok) { close(sock); return -1; }
 
-    // 解析 Content-Length，正文收齐即停（避免依赖 Connection: close 的尾部等待）
-    long content_len = -1;
+    // 解析 Content-Length：续传(206)时它只表示本 range 段长度，需 + 已下载偏移
+    long seg_len = -1;
     char* cl = strcasestr(buf, "content-length:");
-    if (cl) content_len = (long)atoi(cl + 15);
+    if (cl) seg_len = (long)atoi(cl + 15);
 
-    FILE* out = fopen(out_path, "wb");
+    FILE* out = fopen(out_path, resume_from > 0 ? "ab" : "wb");
     if (!out) { close(sock); return -1; }
     int body_start = hdr_end + 4;
-    long body_total = 0;
+    long body_total = resume_from;   // 已落盘偏移（续传起点）
     if (body_start < total) {
         long wb = (long)(total - body_start);
         fwrite(buf + body_start, 1, (size_t)wb, out);
@@ -1250,17 +1266,20 @@ static int dst_http_get_file_port(const char* relpath, const char* out_path, int
     }
 
     time_t deadline = time(NULL) + DST_ASSET_BUDGET;
-    while (content_len < 0 || body_total < content_len) {
+    long want = (seg_len >= 0) ? (resume_from + seg_len) : -1;  // 期望收齐到的字节数
+    while (want < 0 || body_total < want) {
         int n = recv(sock, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n <= 0) break;            // 连接错误或超时 -> 跳出；调用方从上次进度续传
         fwrite(buf, 1, (size_t)n, out);
         body_total += n;
         if (time(NULL) > deadline) { fclose(out); close(sock); return -1; }
     }
+    fflush(out);
     fclose(out);
     close(sock);
-    if (content_len >= 0 && body_total < content_len) {
-        LOGE("prefetch: %s 下载截断 %ld/%ld -> 丢弃", relpath, body_total, content_len);
+    // 未能收齐（连接断/超时）：返回 -1，由 worker 保留文件并续传；不在此丢弃
+    if (want >= 0 && body_total < want) {
+        LOGD("prefetch: %s 本轮收 %ld/%ld（断点续传，保留）", relpath, body_total, want);
         return -1;
     }
     return 0;
@@ -1270,7 +1289,78 @@ static int dst_http_get_file_port(const char* relpath, const char* out_path, int
 static int dst_http_get_file(const char* relpath, const char* out_path) {
     int ports[] = { 80, 3000 };
     for (int i = 0; i < 2; i++) {
-        if (dst_http_get_file_port(relpath, out_path, ports[i]) == 0) return 0;
+        if (dst_http_get_file_port(relpath, out_path, ports[i], 0) == 0) return 0;
+    }
+    return -1;
+}
+
+// 探测整包总字节数：发 Range: bytes=0-0，从 206 响应的 "Content-Range: bytes 0-0/<total>"
+// 解析总长。失败返回 -1。
+static long dst_http_content_length(const char* relpath) {
+    connect_t c = dst_asset_connect();
+    if (c == NULL) return -1;
+    int ports[] = { 80, 3000 };
+    for (int pi = 0; pi < 2; pi++) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) continue;
+        struct timeval tv; tv.tv_sec = DST_ASSET_CONN_TO; tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET; sa.sin_port = htons(ports[pi]);
+        sa.sin_addr.s_addr = inet_addr(DST_ASSET_HOST);
+        if (c(sock, (const struct sockaddr*)&sa, sizeof(sa)) != 0) { close(sock); continue; }
+        char req[512];
+        int rl = snprintf(req, sizeof(req),
+            "GET %s%s HTTP/1.1\r\nHost: %s\r\nUser-Agent: DSTIOS/1.0\r\nAccept: */*\r\n"
+            "Range: bytes=0-0\r\nConnection: close\r\n\r\n",
+            DST_ASSET_BASE, relpath, DST_ASSET_HOST);
+        if (send(sock, req, (size_t)rl, 0) <= 0) { close(sock); continue; }
+        char buf[2048]; int total = 0; int hdr_end = -1;
+        while (total < (int)sizeof(buf)) {
+            int n = recv(sock, buf + total, sizeof(buf) - total, 0);
+            if (n <= 0) break;
+            total += n; hdr_end = dst_find_hdrend(buf, total);
+            if (hdr_end >= 0) break;
+        }
+        close(sock);
+        if (hdr_end < 0) continue;
+        buf[hdr_end] = '\0';
+        char* cr = strcasestr(buf, "content-range:");
+        if (cr) {
+            // 形如 "bytes 0-0/52275030"
+            char* slash = strrchr(cr, '/');
+            if (slash) { long tot = (long)atol(slash + 1); if (tot > 0) return tot; }
+        }
+        // 没有 content-range（服务器不支持 range），退而从普通 content-length 读（不续传仍可用）
+        char* cl = strcasestr(buf, "content-length:");
+        if (cl) { long tot = (long)atoi(cl + 15); if (tot > 0) return tot; }
+    }
+    return -1;
+}
+
+// 断点续传版：循环重试 dst_http_get_file_port，每次从上次进度继续；
+// 网络抖动导致的截断不再整包丢弃，最终收齐才返回 0。max_tries 控制总轮次。
+// 返回 0=收齐并校验完整；-1=超过重试上限仍未收齐。
+static int dst_http_get_file_resume(const char* relpath, const char* out_path,
+                                    long content_total, int max_tries) {
+    for (int attempt = 0; attempt < max_tries; attempt++) {
+        long have = 0;
+        FILE* chk = fopen(out_path, "rb");
+        if (chk) { fseek(chk, 0, SEEK_END); have = ftell(chk); fclose(chk); }
+        if (content_total > 0 && have >= content_total) return 0;  // 已完整
+        int rc = -1;
+        int ports[] = { 80, 3000 };
+        for (int i = 0; i < 2; i++) {
+            if (dst_http_get_file_port(relpath, out_path, ports[i], have) == 0) { rc = 0; break; }
+        }
+        if (rc == 0) {
+            long after = 0; FILE* c2 = fopen(out_path, "rb");
+            if (c2) { fseek(c2, 0, SEEK_END); after = ftell(c2); fclose(c2); }
+            if (content_total <= 0 || after >= content_total) return 0;
+        }
+        LOGD("prefetch: %s 续传轮次 %d 未完成，稍后重试", relpath, attempt + 1);
+        usleep(800000);  // 0.8s 退避，避免空转；后台线程不阻塞游戏
     }
     return -1;
 }
@@ -1346,33 +1436,34 @@ static void* dst_prefetch_worker(void* arg) {
         }
         LOGD("asset worker: ready='%s' server='%s' -> 下载配对整包(scripts+images)", ready_v, server_v);
 
-        // 3) 两个整包都下载到 .dl 并校验；任一失败整体放弃（旧配对保持可用）
+        // 3) 两个整包用【断点续传】下载到版本化临时文件（__<ver>.dl），
+        //    网络抖动只暂停续传、不整包丢弃（保留文件下启继续）；都收齐+魔数校验才落地。
+        //    版本化文件名避免跨版本残留 .dl 污染新版本配对。
         NSArray* names = @[@"scripts.zip", @"images.zip"];
         int ok_all = 1;
         for (NSString* name in names) {
             NSString* tmp = [cacheDir stringByAppendingPathComponent:
-                             [name stringByAppendingString:@".dl"]];
-            if (dst_http_get_file([name UTF8String], [tmp UTF8String]) != 0 ||
+                [NSString stringWithFormat:@"__%s.%@.dl", server_v, name]];
+            // 先探测整包总长（用于续传收齐判定）
+            long ctotal = dst_http_content_length([name UTF8String]);
+            LOGD("asset worker: %s 探测总长=%ld", [name UTF8String], ctotal);
+            if (dst_http_get_file_resume([name UTF8String], [tmp UTF8String], ctotal, 12) != 0 ||
                 !dst_zip_ok([tmp UTF8String])) {
-                LOGE("asset worker: %s 下载/校验失败 -> 放弃本轮", [name UTF8String]);
-                [fm removeItemAtPath:tmp error:nil];
+                LOGE("asset worker: %s 续传超限/校验失败 -> 保留 .dl 下启再试", [name UTF8String]);
                 ok_all = 0;
                 break;
             }
-            LOGD("asset worker: %s .dl 下载+魔数校验通过", [name UTF8String]);
+            LOGD("asset worker: %s 续传收齐+魔数校验通过", [name UTF8String]);
         }
         if (!ok_all) {
-            for (NSString* name in names) {
-                [fm removeItemAtPath:[cacheDir stringByAppendingPathComponent:
-                    [name stringByAppendingString:@".dl"]] error:nil];
-            }
-            return NULL;   // 旧 ready.flag 不动：仍可用旧配对，下次启动重试
+            // 保留已下载的 .dl（下启续传），旧 ready.flag 不动：仍可用旧配对，下次启动重试
+            return NULL;
         }
 
         // 4) 全部成功：一起落地 + 写 ready.flag（此后重定向开启，下次启动生效）
         for (NSString* name in names) {
             NSString* tmp  = [cacheDir stringByAppendingPathComponent:
-                              [name stringByAppendingString:@".dl"]];
+                [NSString stringWithFormat:@"__%s.%@.dl", server_v, name]];
             NSString* dest = [cacheDir stringByAppendingPathComponent:name];
             [fm removeItemAtPath:dest error:nil];
             if (![fm moveItemAtPath:tmp toPath:dest error:nil]) {
@@ -1396,7 +1487,7 @@ static void* dst_prefetch_worker(void* arg) {
 __attribute__((constructor(100)))
 static void dst_prefetch_assets(void) {
     dst_ensure_log();
-    LOGD("=== dst_prefetch_assets v10: spawn background worker (no startup block) ===");
+    LOGD("=== dst_prefetch_assets v11: spawn background worker (no startup block) ===");
     pthread_t t;
     if (pthread_create(&t, NULL, dst_prefetch_worker, NULL) == 0) {
         pthread_detach(t);
