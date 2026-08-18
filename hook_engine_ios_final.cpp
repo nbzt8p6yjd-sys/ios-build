@@ -58,12 +58,34 @@
 
 static uint32_t g_relay_ip = 0;   // 网络字节序，便于直接比较 sin_addr.s_addr
 
-// ---- 授权门控（对齐参考包 _ios_assets_authed）：
-//  g_authed=0 -> 游戏走「原版」：不重定向 UDP、不重定向 Klei 域名、不连私服，
-//              可正常离线单机 / 官方 Klei 联机（参考包「未授权=原版离线游戏」同款）。
-//  g_authed=1 -> 激活完整私有集成（UDP 重写到 relay + Klei 域名重定向 + 私服大厅）。
-//  增强 scripts.zip 始终从服务器动态拉（绝不在 IPA 内烤死），仅用于呈现授权/大厅 UI。
-static int g_authed = 0;
+// ---- 授权门控（对齐参考包 _g_authed，v10 文件型·免重启）：
+//  未授权 -> 游戏走「原版」：不重定向 UDP、不重定向 Klei 域名、不连私服，
+//            可正常离线单机 / 官方 Klei 流程（参考包「未授权=原版」同款）。
+//  已授权 -> 激活完整私有集成（UDP 重写到 relay + Klei 域名重定向 + 私服大厅）。
+//  判据 = Documents/ios_auth_token.txt 存在且非空（参考包 v71：token 主存 CWD 文件，
+//  Lua IOSAuthActivate 成功后 io.open 写入；dylib 惰性 stat，2s TTL 缓存）。
+//  授权 -> 网络重定向在 2 秒内自动生效，免重启；删 token 文件即回到原版。
+//  增强 scripts.zip/images.zip 始终从服务器动态拉（绝不在 IPA 内烤死）。
+static int g_authed_cache = -1;          // -1=未评估 0/1=缓存值
+static time_t g_authed_at = 0;
+
+static int dst_is_authed(void) {
+    time_t now = time(NULL);
+    if (g_authed_cache >= 0 && now - g_authed_at < 2) return g_authed_cache;
+    int authed = 0;
+    @autoreleasepool {
+        NSString* p = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                        stringByAppendingPathComponent:@"ios_auth_token.txt"];
+        NSDictionary* att = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+        if (att) {
+            unsigned long long sz = [att fileSize];
+            if (sz > 0) authed = 1;
+        }
+    }
+    g_authed_cache = authed;
+    g_authed_at = now;
+    return authed;
+}
 
 // ---- 文件日志（真机反馈用，写 Documents/dst_hook.log） ----
 static FILE* g_log = NULL;
@@ -242,8 +264,8 @@ static int   fake_fclose(FILE*);
 static struct hostent* fake_gethostbyname(const char*);
 static int fake_getaddrinfo(const char*, const char*, const struct addrinfo*, struct addrinfo**);
 
-// 授权门控：启动期读 token 向私服 /api/authcheck 校验，设置 g_authed
-static void dst_check_auth(void);
+// 授权门控（v10 文件型）：dst_is_authed() 惰性检查 Documents/ios_auth_token.txt
+// （2s TTL 缓存）。Lua IOSAuthActivate 成功写入后 2 秒内网络重定向自动生效（免重启）。
 
 // ---- 尽力而为的 TLS 证书校验绕过（参考包开箱即用的关键）----
 // 若 OpenSSL 的 X509_verify_cert 符号可被 fishhook 重绑定（动态链接时），
@@ -298,9 +320,10 @@ static void dst_resolve_and_interpose() {
          (void*)orig_open, (void*)orig_openat, (void*)orig_close,
          (void*)orig_fopen, (void*)orig_fclose);
 
-    // 始终重定向模型（对齐参考包）：增强脚本动态拉取 + Klei 域名/UDP 始终重定向到私服；
-    // 授权门控在 Lua 层（IOSLobbyOnline/IOSAuthActivate）+ 服务端（/api/register 等校验 token）。
-    LOGD("always-redirect mode: networking hooks active unconditionally");
+    // v10 门控模型（对齐参考包 _g_authed）：未授权 = 网络完全原版（离线单机/官方流程）；
+    // 授权（Documents/ios_auth_token.txt 非空）= UDP->relay + Klei 域名->私服重定向。
+    // 增强脚本/资源由后台线程动态拉取（constructor 不阻塞），ready.flag 配对落地。
+    LOGD("authed-redirect mode v10: network hooks gated by Documents/ios_auth_token.txt");
 
     // ------------------------------------------------------------------
     // 用 facebook fishhook (rebind_symbols) 替代 dyld_dynamic_interpose。
@@ -476,8 +499,28 @@ static void rewrite_cluster_token_on_close() {
 // 若 Documents/dst_assets_cache/ 下存在已下载副本，则重定向到该副本打开。
 // 这样即使 app bundle 只读（iOS 常态）也能用上服务器下发的整包
 // （参考包式动态加载，文件层实现，不依赖 bundle 可写）。
+// v10 配对条件：仅当 ready.flag 存在（scripts.zip 与 images.zip 都完整下载并通过
+// PK 魔数校验后由后台线程写入）才重定向——保证两个包永远版本配对（缺一会崩），
+// 且首次启动（后台尚未下载完）时游戏完全使用内置原版包，不阻塞、不白屏。
 static const char* g_dst_db_names[] = { "scripts.zip", "images.zip" };
 static char g_dst_redirect_buf[1024];
+static int  g_ready_cache = -1;      // -1=未评估
+static time_t g_ready_at = 0;
+
+static int dst_assets_ready(void) {
+    time_t now = time(NULL);
+    if (g_ready_cache >= 0 && now - g_ready_at < 3) return g_ready_cache;
+    int ready = 0;
+    @autoreleasepool {
+        NSString* flag = [[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                            stringByAppendingPathComponent:@"dst_assets_cache"]
+                           stringByAppendingPathComponent:@"ready.flag"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:flag]) ready = 1;
+    }
+    g_ready_cache = ready;
+    g_ready_at = now;
+    return ready;
+}
 
 static const char* dst_redirect_databundle(const char* path) {
     if (!path) return path;
@@ -488,6 +531,7 @@ static const char* dst_redirect_databundle(const char* path) {
         if (strcmp(base, g_dst_db_names[i]) == 0) { hit = 1; break; }
     }
     if (!hit) return path;
+    if (!dst_assets_ready()) return path;   // 双包未配对落地 -> 用内置原版
     @autoreleasepool {
         NSString* nm = [NSString stringWithUTF8String:base];
         NSString* cache = [[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
@@ -660,8 +704,10 @@ static int rewrite_to_relay(const struct sockaddr* addr, struct sockaddr_in* na)
 
 static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
+    // v10 授权门控（参考包 _g_authed 同款）：未授权 = 一律透传，游戏走原版网络
+    int authed = dst_is_authed();
     int st = sock_type(socket);
-    if (st == SOCK_DGRAM) {
+    if (authed && st == SOCK_DGRAM) {
         struct sockaddr_in na;
         int red = rewrite_to_relay(addr, &na);
         dst_diag("connect", socket, addr ? addr->sa_family : 0, addr, red);
@@ -669,7 +715,7 @@ static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) 
             LOGD("connect(UDP) -> relay");
             return orig_connect(socket, (const struct sockaddr*)&na, sizeof(na));
         }
-    } else if (addr && addr->sa_family == AF_INET) {
+    } else if (authed && addr && addr->sa_family == AF_INET) {
         // TCP: 在 socket 层把到外网 Web 端口(80/443)的连接重定向到私服，
         // 覆盖 libcurl(c-ares) 等绕过 getaddrinfo/gethostbyname 的解析路径
         // （参考包即采用 connect 层重定向，故能开箱即用）。
@@ -696,7 +742,7 @@ static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) 
 static ssize_t fake_sendto(int socket, const void* buffer, size_t length, int flags,
                             const struct sockaddr* dest_addr, socklen_t dest_len) {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
-    if (sock_type(socket) == SOCK_DGRAM) {
+    if (dst_is_authed() && sock_type(socket) == SOCK_DGRAM) {
         struct sockaddr_in na;
         int red = rewrite_to_relay(dest_addr, &na);
         dst_diag("sendto", socket, dest_addr ? dest_addr->sa_family : 0, dest_addr, red);
@@ -722,7 +768,8 @@ static int fake_bind(int socket, const struct sockaddr* addr, socklen_t len) {
         dst_diag("bind", socket, fam, addr, is_any);
         // 房主游戏服务器监听 0.0.0.0(UDP)：主动发 1 字节注册包到中继，
         // 让中继记录房主出口地址，加入者才能被转发过来（NAT 打洞）。
-        if (fam == AF_INET && is_any) {
+        // v10：仅在授权后注册（未授权不碰 relay，游戏保持原版行为）。
+        if (fam == AF_INET && is_any && dst_is_authed()) {
             struct sockaddr_in na;
             memset(&na, 0, sizeof(na));
             na.sin_family = AF_INET;
@@ -1018,7 +1065,7 @@ static int auth_host_matches(const char* name) {
 }
 
 static struct hostent* fake_gethostbyname(const char* name) {
-    if (orig_gethostbyname && auth_host_matches(name)) {
+    if (orig_gethostbyname && dst_is_authed() && auth_host_matches(name)) {
         LOGD("[AUTH-FORGE] gethostbyname(%s) -> %s", name ? name : "(null)", AUTH_REDIR_IP);
         static struct in_addr s_addr;
         static char* s_addrlist[2];
@@ -1038,7 +1085,7 @@ static struct hostent* fake_gethostbyname(const char* name) {
 
 static int fake_getaddrinfo(const char* node, const char* service,
                             const struct addrinfo* hints, struct addrinfo** res) {
-    if (orig_getaddrinfo && node && auth_host_matches(node)) {
+    if (orig_getaddrinfo && dst_is_authed() && node && auth_host_matches(node)) {
         LOGD("[AUTH-FORGE] getaddrinfo(%s) -> %s", node, AUTH_REDIR_IP);
         // Delegate to the real resolver with our IP as the node.
         return orig_getaddrinfo(AUTH_REDIR_IP, service, hints, res);
@@ -1123,22 +1170,20 @@ static void dst_foundation_swizzle_ctor(void) {
     dst_swizzle_foundation();
 }
 
-// ============ [DYNAMIC ASSET LOAD] 启动时从私服拉取 scripts.zip / images.zip 覆盖内置包 ============
-// 与参考包「运行期动态加载整包」同款思路：安装包只含兜底包，启动时经 HTTP 从私服下载
-// 最新整包覆盖内置 data/databundles/*，以后更新只改服务器文件、无需重打包 IPA。
-// 全部 fail-safe，绝不因下载失败而崩游戏：
-//  - 先拉极小 version.txt 比对本地缓存版本，仅版本变化才下载整包（正常启动只做 1 次小 GET）；
-//  - 用捕获的原始 orig_connect（不经 fishhook 重定向）直连服务器 :3000；
-//  - 整包下载有总时长预算（防拖慢启动被看门狗杀），超时/失败则保留内置兜底包；
-//  - 下载落盘到 Documents/dst_assets_cache 后用 PK 魔数校验，再 move 覆盖 bundle 文件，
-//    失败自动回滚到 .bak；任何异常均被 @try 吞掉。
+// ============ [DYNAMIC ASSET LOAD] 游戏运行时（后台线程）从私服拉取 scripts.zip + images.zip ============
+// 与参考包同款思路（KAlert：init 只做本地重建，网络动作绝不卡启动）：
+//  - constructor 只 detach 后台线程（v10 修复：不再在 main 前同步下载，白屏/看门狗杀机彻底消除）；
+//  - 后台线程拉极小 version.txt 与本地 ready.flag 版本比对，仅版本变化才下载整包；
+//  - 用捕获的原始 orig_connect（不经 fishhook 重定向）直连服务器 :80/:3000；
+//  - scripts.zip 与 images.zip 都下载并通过 PK 魔数 + Content-Length 校验后才一起落地，
+//    并写 ready.flag（重定向唯一开关）——两包永远配对，杜绝版本错配崩溃；
+//  - 任一步失败保留旧配对（或内置原版包），下次启动重试；任何异常均被 @try 吞掉。
 #include <time.h>
 #define DST_ASSET_HOST    "47.122.115.99"
 #define DST_ASSET_PORT    3000
 #define DST_ASSET_BASE    "/dst/"
 #define DST_ASSET_CONN_TO 15   // 单 recv 超时（秒）；整包按块收，单块久等才判超时
-#define DST_ASSET_BUDGET  25   // 整包下载总预算（秒，启动安全；超时则保留内置兜底）
-#define DST_ASSET_VERFILE "dst_assets_version.txt"
+#define DST_ASSET_BUDGET  180  // 单整包下载总预算（秒）——后台线程无启动看门狗风险，放宽
 
 static connect_t dst_asset_connect(void) {
     if (orig_connect) return orig_connect;
@@ -1230,120 +1275,50 @@ static int dst_http_get_file(const char* relpath, const char* out_path) {
     return -1;
 }
 
-// ============ 授权门控：启动期向私服 /api/authcheck 校验 token，设置 g_authed ============
-// 与参考包 _ios_assets_authed 同思路：未授权 -> 不激活私有集成，游戏走原版。
-// 仅做 token 有效性校验（device 由 Lua 层在注册/心跳时再校验，避免启动期依赖设备文件）。
-static int dst_http_get_text(const char* relpath, int port, char* out, size_t outlen) {
-    out[0] = 0;
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return -1;
-    struct timeval tv; tv.tv_sec = 5; tv.tv_usec = 0;   // 短超时：离线/服务器不可达不阻塞启动
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET; sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = inet_addr(DST_ASSET_HOST);
-    if (connect(sock, (const struct sockaddr*)&sa, sizeof(sa)) != 0) { close(sock); return -1; }
-    char req[512];
-    int rl = snprintf(req, sizeof(req),
-        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: DSTIOS/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-        relpath, DST_ASSET_HOST);
-    if (send(sock, req, (size_t)rl, 0) <= 0) { close(sock); return -1; }
-    char buf[32768]; int total = 0; int hdr_end = -1;
-    while (total < (int)sizeof(buf)) {
-        int n = recv(sock, buf + total, sizeof(buf) - total, 0);
-        if (n <= 0) break;
-        total += n;
-        hdr_end = dst_find_hdrend(buf, total);
-        if (hdr_end >= 0) break;
-    }
-    if (hdr_end < 0) { close(sock); return -1; }
-    buf[hdr_end] = '\0';
-    if (strstr(buf, " 200 ") == NULL && strstr(buf, "200 OK") == NULL) { close(sock); return -1; }
-    long content_len = -1; char* cl = strcasestr(buf, "content-length:");
-    if (cl) content_len = (long)atoi(cl + 15);
-    int body_start = hdr_end + 4; long body_total = 0;
-    if (body_start < total && (size_t)(total - body_start) < outlen) {
-        memcpy(out, buf + body_start, (size_t)(total - body_start));
-        out[total - body_start] = 0; body_total += (total - body_start);
-    }
-    time_t deadline = time(NULL) + 8;
-    while (content_len < 0 || body_total < content_len) {
-        int n = recv(sock, buf, sizeof(buf), 0);
-        if (n <= 0) break;
-        if ((size_t)body_total + (size_t)n < outlen) {
-            memcpy(out + body_total, buf, (size_t)n); out[body_total + n] = 0;
-        }
-        body_total += n;
-        if (time(NULL) > deadline) break;
-    }
-    close(sock);
-    return 0;
-}
+// ============ v10 动态资产：后台线程下载（游戏运行时，绝不阻塞启动） ============
+// 参考包时机模型：KAlert init 只做「本地」重建（enhanced zip rebuilt at init /
+// up-to-date skip rebuild），网络动作不卡启动。我们等价实现：
+//   constructor(100) 只 detach 一个后台线程后立即返回（main 不被阻塞，不白屏）；
+//   线程内比对服务器版本 -> 下载 scripts.zip + images.zip 两个整包到 .dl 临时文件 ->
+//   都通过 PK 魔数 + Content-Length 完整性校验后一起落地 + 写 ready.flag。
+// ready.flag 是重定向的唯一开关（见 dst_redirect_databundle）：首启/下载中/失败时
+// 游戏用内置原版包（完全原版体验）；两个包永远版本配对落地，杜绝半新半旧崩溃。
 
-static void dst_check_auth(void) {
-    g_authed = 0;
-    @autoreleasepool {
-        NSString* doc = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-        NSString* tkPath = [doc stringByAppendingPathComponent:@"ios_auth_token.txt"];
-        NSString* token = [NSString stringWithContentsOfFile:tkPath encoding:NSUTF8StringEncoding error:nil];
-        if (!token || [token length] == 0) {
-            LOGD("auth: 无 token -> 未授权（原版/离线模式）");
-            return;
-        }
-        token = [token stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        NSString* rel = [NSString stringWithFormat:@"/api/authcheck?token=%@",
-                         [token stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
-        char resp[16384]; int ok = 0;
-        int ports[] = { 3000, 80 };   // :3000 为 FastAPI 鉴权端点（:80 旧后端会误返 status:ok，仅认 ok:true）
-        for (int i = 0; i < 2; i++) {
-            if (dst_http_get_text([rel UTF8String], ports[i], resp, sizeof(resp)) == 0) {
-                if (strstr(resp, "\"ok\":true") || strstr(resp, "\"ok\": true")) { ok = 1; break; }
-            }
-        }
-        if (ok) { g_authed = 1; LOGD("auth: token 有效 -> 私有集成已激活"); }
-        else    { LOGD("auth: token 无效/过期 或 服务器不可达 -> 原版/离线模式"); }
-    }
-}
-
-static int dst_read_local_version(char* buf, size_t buflen) {
+static int dst_read_ready_version(char* buf, size_t buflen) {
     buf[0] = 0;
     @autoreleasepool {
-        NSString* p = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
-                        stringByAppendingPathComponent:@DST_ASSET_VERFILE];
+        NSString* p = [[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                        stringByAppendingPathComponent:@"dst_assets_cache"]
+                       stringByAppendingPathComponent:@"ready.flag"];
         FILE* f = fopen([p UTF8String], "r");
         if (!f) return 0;
         if (fgets(buf, (int)buflen, f) == NULL) { fclose(f); return 0; }
         fclose(f);
         size_t L = strlen(buf);
-        while (L > 0 && (buf[L-1]=='\n' || buf[L-1]=='\r')) buf[--L] = 0;
+        while (L > 0 && (buf[L-1]=='\n' || buf[L-1]=='\r' || buf[L-1]==' ')) buf[--L] = 0;
         return 1;
     }
 }
-static void dst_write_local_version(const char* v) {
-    @autoreleasepool {
-        NSString* p = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
-                        stringByAppendingPathComponent:@DST_ASSET_VERFILE];
-        FILE* f = fopen([p UTF8String], "w");
-        if (f) { fputs(v, f); fputc('\n', f); fclose(f); }
-    }
+
+static int dst_zip_ok(const char* path) {
+    unsigned char sig[4] = {0};
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    int ok = (fread(sig, 1, 4, f) == 4);
+    fclose(f);
+    return ok && sig[0]=='P' && sig[1]=='K' && sig[2]==0x03 && sig[3]==0x04;
 }
 
-__attribute__((constructor(100)))
-static void dst_prefetch_assets(void) {
+static void* dst_prefetch_worker(void* arg) {
+    (void)arg;
     @try {
-        dst_ensure_log();
-        LOGD("=== dst_prefetch_assets: dynamic asset load (server pull) ===");
-        NSString* bundleDB = [[[NSBundle mainBundle] bundlePath]
-                               stringByAppendingPathComponent:@"data/databundles"];
+        LOGD("=== dst asset worker start (background, game keeps running) v10 ===");
+        NSFileManager* fm = [NSFileManager defaultManager];
         NSString* cacheDir = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
-                               stringByAppendingPathComponent:@"dst_assets_cache"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:cacheDir
-                                      withIntermediateDirectories:YES attributes:nil error:nil];
+                              stringByAppendingPathComponent:@"dst_assets_cache"];
+        [fm createDirectoryAtPath:cacheDir withIntermediateDirectories:YES attributes:nil error:nil];
 
-        // 1) 版本比对
-        char local_v[128]; local_v[0] = 0;
-        int has_local = dst_read_local_version(local_v, sizeof(local_v));
+        // 1) 拉服务器版本（直连 IP，不经 Klei 域名，与授权状态无关）
         char server_v[128]; server_v[0] = 0;
         NSString* vtmp = [cacheDir stringByAppendingPathComponent:@"version.tmp"];
         if (dst_http_get_file("version.txt", [vtmp UTF8String]) == 0) {
@@ -1356,89 +1331,76 @@ static void dst_prefetch_assets(void) {
                 fclose(f);
             }
         }
+        [fm removeItemAtPath:vtmp error:nil];
         if (server_v[0] == 0) {
-            LOGD("prefetch: version.txt 拉取失败（可能离线，走本地兜底）");
+            LOGD("asset worker: version.txt 拉取失败（离线？），保留现状退出");
+            return NULL;
         }
-        if (has_local && server_v[0] != 0 && strcmp(local_v, server_v) == 0) {
-            LOGD("prefetch: 版本 %s 已是最新 -> 跳过下载", server_v);
+
+        // 2) ready.flag 内容 = 已配对落地的版本；一致则无事可做
+        char ready_v[128]; ready_v[0] = 0;
+        dst_read_ready_version(ready_v, sizeof(ready_v));
+        if (strcmp(ready_v, server_v) == 0) {
+            LOGD("asset worker: 已是最新配对版本 %s -> skip", server_v);
+            return NULL;
         }
-        LOGD("prefetch: 版本 local='%s' server='%s' -> 进入资源处理", local_v, server_v);
+        LOGD("asset worker: ready='%s' server='%s' -> 下载配对整包(scripts+images)", ready_v, server_v);
 
-        // 是否需要下载：服务器有版本且（本地无版本 或 版本不同）
-        int need_dl = (server_v[0] != 0) && (!has_local || strcmp(local_v, server_v) != 0);
-        LOGD("prefetch: need_dl=%d", need_dl);
-
-        // 2) 逐个处理：先尝试从服务器下载到 cache（不碰只读 bundle），
-//    再兜底——若 cache 缺失则从 bundle 自身复制，确保重定向目标永远存在
-//    （参考包 mods_fs 同款鲁棒性：enhanced zip 永远本地存在，网络只是叠加层）
-// 仅动态拉 scripts.zip（增强脚本/大厅/授权 UI）；images 为静态资源，留在 bundle 内。
-// 增强脚本无论授权与否都拉取（用于呈现授权/大厅入口）；但私有集成网络(UDP/域名)
-// 仅在 g_authed=1 时激活——未授权时游戏仍走原版（离线/官方）。
-NSArray* assets = @[@"scripts.zip"];
-NSFileManager* fm = [NSFileManager defaultManager];
-for (NSString* name in assets) {
-    @try {
-        NSString* cachePath  = [cacheDir stringByAppendingPathComponent:name];
-        NSString* bundlePath = [bundleDB stringByAppendingPathComponent:name];
-
-        // (a) 需要且能下载 -> 下载到 cache（不再覆盖 bundle）
-        if (need_dl) {
+        // 3) 两个整包都下载到 .dl 并校验；任一失败整体放弃（旧配对保持可用）
+        NSArray* names = @[@"scripts.zip", @"images.zip"];
+        int ok_all = 1;
+        for (NSString* name in names) {
             NSString* tmp = [cacheDir stringByAppendingPathComponent:
-                             [name stringByAppendingString:@".tmp"]];
-            if (dst_http_get_file([name UTF8String], [tmp UTF8String]) == 0) {
-                unsigned char sig[4] = {0};
-                FILE* vf = fopen([tmp UTF8String], "rb");
-                int ok = (vf && fread(sig, 1, 4, vf) == 4);
-                if (vf) fclose(vf);
-                if (ok && sig[0]=='P' && sig[1]=='K' && sig[2]==0x03 && sig[3]==0x04) {
-                    [fm removeItemAtPath:cachePath error:nil];
-                    if ([fm moveItemAtPath:tmp toPath:cachePath error:nil]) {
-                        LOGD("prefetch: %s 下载成功 -> cache", [name UTF8String]);
-                    } else {
-                        LOGE("prefetch: %s 移入 cache 失败", [name UTF8String]);
-                    }
-                } else {
-                    LOGE("prefetch: %s 非合法 zip（魔数错误）-> 丢弃", [name UTF8String]);
-                    [fm removeItemAtPath:tmp error:nil];
-                }
+                             [name stringByAppendingString:@".dl"]];
+            if (dst_http_get_file([name UTF8String], [tmp UTF8String]) != 0 ||
+                !dst_zip_ok([tmp UTF8String])) {
+                LOGE("asset worker: %s 下载/校验失败 -> 放弃本轮", [name UTF8String]);
+                [fm removeItemAtPath:tmp error:nil];
+                ok_all = 0;
+                break;
+            }
+            LOGD("asset worker: %s .dl 下载+魔数校验通过", [name UTF8String]);
+        }
+        if (!ok_all) {
+            for (NSString* name in names) {
+                [fm removeItemAtPath:[cacheDir stringByAppendingPathComponent:
+                    [name stringByAppendingString:@".dl"]] error:nil];
+            }
+            return NULL;   // 旧 ready.flag 不动：仍可用旧配对，下次启动重试
+        }
+
+        // 4) 全部成功：一起落地 + 写 ready.flag（此后重定向开启，下次启动生效）
+        for (NSString* name in names) {
+            NSString* tmp  = [cacheDir stringByAppendingPathComponent:
+                              [name stringByAppendingString:@".dl"]];
+            NSString* dest = [cacheDir stringByAppendingPathComponent:name];
+            [fm removeItemAtPath:dest error:nil];
+            if (![fm moveItemAtPath:tmp toPath:dest error:nil]) {
+                LOGE("asset worker: %s 落地失败！", [name UTF8String]);
             } else {
-                LOGE("prefetch: %s 服务器下载失败（将走离线兜底）", [name UTF8String]);
+                LOGD("asset worker: %s 落地 -> cache（%lld bytes）", [name UTF8String],
+                     (long long)[[fm attributesOfItemAtPath:dest error:nil] fileSize]);
             }
         }
-
-        // (b) 兜底：cache 缺失则从 bundle 自身复制（保证重定向目标存在）
-        if (![fm fileExistsAtPath:cachePath]) {
-            if ([fm fileExistsAtPath:bundlePath]) {
-                if ([fm copyItemAtPath:bundlePath toPath:cachePath error:nil]) {
-                    LOGD("prefetch: %s 离线兜底（bundle -> cache）", [name UTF8String]);
-                } else {
-                    LOGE("prefetch: %s 兜底复制失败", [name UTF8String]);
-                }
-            } else {
-                LOGE("prefetch: %s 既无 cache 也无 bundle 源", [name UTF8String]);
-            }
-        }
-
-        // (c) 最终确认
-        if ([fm fileExistsAtPath:cachePath]) {
-            LOGD("prefetch: %s 就绪 -> %s", [name UTF8String], [cachePath UTF8String]);
-        } else {
-            LOGE("prefetch: %s 仍缺失（重定向将失效！）", [name UTF8String]);
-        }
+        NSString* flag = [cacheDir stringByAppendingPathComponent:@"ready.flag"];
+        FILE* f = fopen([flag UTF8String], "w");
+        if (f) { fputs(server_v, f); fputc('\n', f); fclose(f); }
+        g_ready_cache = -1;   // 立即失效重定向开关缓存
+        LOGD("asset worker: 配对完成 ready.flag=%s（下次启动游戏生效）", server_v);
     } @catch (NSException* e) {
-        LOGE("prefetch 循环异常(%s): %s", [name UTF8String], [[e description] UTF8String]);
+        LOGE("asset worker 异常: %s", [[e description] UTF8String]);
     }
-}
-        // 仅当增强 scripts 已落地才记录版本；否则下次启动重试下载（避免超时后误判已最新）
-        NSString* sc = [cacheDir stringByAppendingPathComponent:@"scripts.zip"];
-        if ([fm fileExistsAtPath:sc] && server_v[0] != 0) {
-            dst_write_local_version(server_v);
-        } else {
-            LOGD("prefetch: scripts 未落地，不记录版本（下次启动重试）");
-        }
-        LOGD("prefetch: 完成（g_authed=%d）", g_authed);
-    } @catch (NSException* e) {
-        LOGE("dst_prefetch_assets 异常: %s", [[e description] UTF8String]);
-    }
+    return NULL;
 }
 
+__attribute__((constructor(100)))
+static void dst_prefetch_assets(void) {
+    dst_ensure_log();
+    LOGD("=== dst_prefetch_assets v10: spawn background worker (no startup block) ===");
+    pthread_t t;
+    if (pthread_create(&t, NULL, dst_prefetch_worker, NULL) == 0) {
+        pthread_detach(t);
+    } else {
+        LOGE("prefetch: pthread_create 失败（跳过动态资产，游戏用内置包）");
+    }
+}
