@@ -58,6 +58,13 @@
 
 static uint32_t g_relay_ip = 0;   // 网络字节序，便于直接比较 sin_addr.s_addr
 
+// ---- 授权门控（对齐参考包 _ios_assets_authed）：
+//  g_authed=0 -> 游戏走「原版」：不重定向 UDP、不重定向 Klei 域名、不连私服，
+//              可正常离线单机 / 官方 Klei 联机（参考包「未授权=原版离线游戏」同款）。
+//  g_authed=1 -> 激活完整私有集成（UDP 重写到 relay + Klei 域名重定向 + 私服大厅）。
+//  增强 scripts.zip 始终从服务器动态拉（绝不在 IPA 内烤死），仅用于呈现授权/大厅 UI。
+static int g_authed = 0;
+
 // ---- 文件日志（真机反馈用，写 Documents/dst_hook.log） ----
 static FILE* g_log = NULL;
 
@@ -235,6 +242,9 @@ static int   fake_fclose(FILE*);
 static struct hostent* fake_gethostbyname(const char*);
 static int fake_getaddrinfo(const char*, const char*, const struct addrinfo*, struct addrinfo**);
 
+// 授权门控：启动期读 token 向私服 /api/authcheck 校验，设置 g_authed
+static void dst_check_auth(void);
+
 // ---- 尽力而为的 TLS 证书校验绕过（参考包开箱即用的关键）----
 // 若 OpenSSL 的 X509_verify_cert 符号可被 fishhook 重绑定（动态链接时），
 // 直接返回 1，使自签 CA 也被接受，无需设备手动信任。
@@ -287,6 +297,10 @@ static void dst_resolve_and_interpose() {
          (void*)orig_connect, (void*)orig_sendto, (void*)orig_bind,
          (void*)orig_open, (void*)orig_openat, (void*)orig_close,
          (void*)orig_fopen, (void*)orig_fclose);
+
+    // ---- 授权门控：必须在 rebind 之前用原始 connect 校验 token ----
+    dst_check_auth();
+    LOGD("auth gate applied: g_authed=%d (1=私有集成已激活, 0=原版/离线模式)", g_authed);
 
     // ------------------------------------------------------------------
     // 用 facebook fishhook (rebind_symbols) 替代 dyld_dynamic_interpose。
@@ -651,7 +665,7 @@ static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) 
         struct sockaddr_in na;
         int red = rewrite_to_relay(addr, &na);
         dst_diag("connect", socket, addr ? addr->sa_family : 0, addr, red);
-        if (red) {
+        if (g_authed && red) {
             LOGD("connect(UDP) -> relay");
             return orig_connect(socket, (const struct sockaddr*)&na, sizeof(na));
         }
@@ -663,7 +677,7 @@ static int fake_connect(int socket, const struct sockaddr* addr, socklen_t len) 
         uint32_t ip = sin->sin_addr.s_addr;
         int port = ntohs(sin->sin_port);
         uint32_t server_ip = inet_addr(DST_RELAY_IP);
-        if (!is_loopback(ip) && ip != g_relay_ip && ip != server_ip
+        if (g_authed && !is_loopback(ip) && ip != g_relay_ip && ip != server_ip
             && (port == 80 || port == 443)) {
             struct sockaddr_in na;
             memset(&na, 0, sizeof(na));
@@ -686,7 +700,7 @@ static ssize_t fake_sendto(int socket, const void* buffer, size_t length, int fl
         struct sockaddr_in na;
         int red = rewrite_to_relay(dest_addr, &na);
         dst_diag("sendto", socket, dest_addr ? dest_addr->sa_family : 0, dest_addr, red);
-        if (red) {
+        if (g_authed && red) {
             return orig_sendto(socket, buffer, length, flags,
                                (const struct sockaddr*)&na, sizeof(na));
         }
@@ -708,7 +722,8 @@ static int fake_bind(int socket, const struct sockaddr* addr, socklen_t len) {
         dst_diag("bind", socket, fam, addr, is_any);
         // 房主游戏服务器监听 0.0.0.0(UDP)：主动发 1 字节注册包到中继，
         // 让中继记录房主出口地址，加入者才能被转发过来（NAT 打洞）。
-        if (fam == AF_INET && is_any) {
+        // 仅授权后激活（未授权不向 relay 注册，游戏 UDP 直连原服务器）。
+        if (g_authed && fam == AF_INET && is_any) {
             struct sockaddr_in na;
             memset(&na, 0, sizeof(na));
             na.sin_family = AF_INET;
@@ -1004,7 +1019,7 @@ static int auth_host_matches(const char* name) {
 }
 
 static struct hostent* fake_gethostbyname(const char* name) {
-    if (orig_gethostbyname && auth_host_matches(name)) {
+    if (g_authed && orig_gethostbyname && auth_host_matches(name)) {
         LOGD("[AUTH-FORGE] gethostbyname(%s) -> %s", name ? name : "(null)", AUTH_REDIR_IP);
         static struct in_addr s_addr;
         static char* s_addrlist[2];
@@ -1024,7 +1039,7 @@ static struct hostent* fake_gethostbyname(const char* name) {
 
 static int fake_getaddrinfo(const char* node, const char* service,
                             const struct addrinfo* hints, struct addrinfo** res) {
-    if (orig_getaddrinfo && node && auth_host_matches(node)) {
+    if (g_authed && orig_getaddrinfo && node && auth_host_matches(node)) {
         LOGD("[AUTH-FORGE] getaddrinfo(%s) -> %s", node, AUTH_REDIR_IP);
         // Delegate to the real resolver with our IP as the node.
         return orig_getaddrinfo(AUTH_REDIR_IP, service, hints, res);
@@ -1207,13 +1222,89 @@ static int dst_http_get_file_port(const char* relpath, const char* out_path, int
     return 0;
 }
 
-// 依次尝试多个端口（优先 :3000，失败回退 :80），任一成功即返回 0
+// 依次尝试多个端口（静态资源在 :80 nginx 托管，优先 :80），任一成功即返回 0
 static int dst_http_get_file(const char* relpath, const char* out_path) {
-    int ports[] = { 3000, 80 };
+    int ports[] = { 80, 3000 };
     for (int i = 0; i < 2; i++) {
         if (dst_http_get_file_port(relpath, out_path, ports[i]) == 0) return 0;
     }
     return -1;
+}
+
+// ============ 授权门控：启动期向私服 /api/authcheck 校验 token，设置 g_authed ============
+// 与参考包 _ios_assets_authed 同思路：未授权 -> 不激活私有集成，游戏走原版。
+// 仅做 token 有效性校验（device 由 Lua 层在注册/心跳时再校验，避免启动期依赖设备文件）。
+static int dst_http_get_text(const char* relpath, int port, char* out, size_t outlen) {
+    out[0] = 0;
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    struct timeval tv; tv.tv_sec = 5; tv.tv_usec = 0;   // 短超时：离线/服务器不可达不阻塞启动
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET; sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr(DST_ASSET_HOST);
+    if (connect(sock, (const struct sockaddr*)&sa, sizeof(sa)) != 0) { close(sock); return -1; }
+    char req[512];
+    int rl = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: DSTIOS/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        relpath, DST_ASSET_HOST);
+    if (send(sock, req, (size_t)rl, 0) <= 0) { close(sock); return -1; }
+    char buf[32768]; int total = 0; int hdr_end = -1;
+    while (total < (int)sizeof(buf)) {
+        int n = recv(sock, buf + total, sizeof(buf) - total, 0);
+        if (n <= 0) break;
+        total += n;
+        hdr_end = dst_find_hdrend(buf, total);
+        if (hdr_end >= 0) break;
+    }
+    if (hdr_end < 0) { close(sock); return -1; }
+    buf[hdr_end] = '\0';
+    if (strstr(buf, " 200 ") == NULL && strstr(buf, "200 OK") == NULL) { close(sock); return -1; }
+    long content_len = -1; char* cl = strcasestr(buf, "content-length:");
+    if (cl) content_len = (long)atoi(cl + 15);
+    int body_start = hdr_end + 4; long body_total = 0;
+    if (body_start < total && (size_t)(total - body_start) < outlen) {
+        memcpy(out, buf + body_start, (size_t)(total - body_start));
+        out[total - body_start] = 0; body_total += (total - body_start);
+    }
+    time_t deadline = time(NULL) + 8;
+    while (content_len < 0 || body_total < content_len) {
+        int n = recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        if ((size_t)body_total + (size_t)n < outlen) {
+            memcpy(out + body_total, buf, (size_t)n); out[body_total + n] = 0;
+        }
+        body_total += n;
+        if (time(NULL) > deadline) break;
+    }
+    close(sock);
+    return 0;
+}
+
+static void dst_check_auth(void) {
+    g_authed = 0;
+    @autoreleasepool {
+        NSString* doc = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+        NSString* tkPath = [doc stringByAppendingPathComponent:@"ios_auth_token.txt"];
+        NSString* token = [NSString stringWithContentsOfFile:tkPath encoding:NSUTF8StringEncoding error:nil];
+        if (!token || [token length] == 0) {
+            LOGD("auth: 无 token -> 未授权（原版/离线模式）");
+            return;
+        }
+        token = [token stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString* rel = [NSString stringWithFormat:@"/api/authcheck?token=%@",
+                         [token stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
+        char resp[16384]; int ok = 0;
+        int ports[] = { 3000, 80 };   // :3000 为 FastAPI 鉴权端点（:80 旧后端会误返 status:ok，仅认 ok:true）
+        for (int i = 0; i < 2; i++) {
+            if (dst_http_get_text([rel UTF8String], ports[i], resp, sizeof(resp)) == 0) {
+                if (strstr(resp, "\"ok\":true") || strstr(resp, "\"ok\": true")) { ok = 1; break; }
+            }
+        }
+        if (ok) { g_authed = 1; LOGD("auth: token 有效 -> 私有集成已激活"); }
+        else    { LOGD("auth: token 无效/过期 或 服务器不可达 -> 原版/离线模式"); }
+    }
 }
 
 static int dst_read_local_version(char* buf, size_t buflen) {
@@ -1281,7 +1372,10 @@ static void dst_prefetch_assets(void) {
         // 2) 逐个处理：先尝试从服务器下载到 cache（不碰只读 bundle），
 //    再兜底——若 cache 缺失则从 bundle 自身复制，确保重定向目标永远存在
 //    （参考包 mods_fs 同款鲁棒性：enhanced zip 永远本地存在，网络只是叠加层）
-NSArray* assets = @[@"scripts.zip", @"images.zip"];
+// 仅动态拉 scripts.zip（增强脚本/大厅/授权 UI）；images 为静态资源，留在 bundle 内。
+// 增强脚本无论授权与否都拉取（用于呈现授权/大厅入口）；但私有集成网络(UDP/域名)
+// 仅在 g_authed=1 时激活——未授权时游戏仍走原版（离线/官方）。
+NSArray* assets = @[@"scripts.zip"];
 NSFileManager* fm = [NSFileManager defaultManager];
 for (NSString* name in assets) {
     @try {
@@ -1336,8 +1430,14 @@ for (NSString* name in assets) {
         LOGE("prefetch 循环异常(%s): %s", [name UTF8String], [[e description] UTF8String]);
     }
 }
-        dst_write_local_version(server_v);
-        LOGD("prefetch: 完成，本地版本=%s", server_v);
+        // 仅当增强 scripts 已落地才记录版本；否则下次启动重试下载（避免超时后误判已最新）
+        NSString* sc = [cacheDir stringByAppendingPathComponent:@"scripts.zip"];
+        if ([fm fileExistsAtPath:sc] && server_v[0] != 0) {
+            dst_write_local_version(server_v);
+        } else {
+            LOGD("prefetch: scripts 未落地，不记录版本（下次启动重试）");
+        }
+        LOGD("prefetch: 完成（g_authed=%d）", g_authed);
     } @catch (NSException* e) {
         LOGE("dst_prefetch_assets 异常: %s", [[e description] UTF8String]);
     }
