@@ -1199,11 +1199,30 @@ static int dst_find_hdrend(const char* buf, int len) {
 }
 
 // HTTP/1.1 GET relpath（如 "scripts.zip"）写入 out_path。
+// ---- 实时下载进度上报（供 Lua 主菜单画进度条）----
+// 后台 worker 下载整包时把 scripts/images 的「已下载/总长」写入
+// Documents/dst_assets_cache/progress.txt（两行），Lua 每帧读取即可显示进度条。
+static long g_prog_cur[2]   = {0, 0};   // [0]=scripts [1]=images
+static long g_prog_total[2] = {0, 0};
+static void dst_write_progress_file(void) {
+    @autoreleasepool {
+        NSString* p = [[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                          stringByAppendingPathComponent:@"dst_assets_cache"]
+                         stringByAppendingPathComponent:@"progress.txt"];
+        FILE* f = fopen([p UTF8String], "w");
+        if (f) {
+            fprintf(f, "scripts %ld %ld\n", g_prog_cur[0], g_prog_total[0]);
+            fprintf(f, "images %ld %ld\n",  g_prog_cur[1], g_prog_total[1]);
+            fclose(f);
+        }
+    }
+}
+
 // resume_from>0 时发送 Range 请求从上次进度继续；支持连接错误/超时的单次续传重试
 // （每次重试仍从上次已落盘进度继续，不重下）。成功返回 0，失败返回 -1。
 // 注意：本函数不删除 out_path；续传语义由调用方（worker）保留临时文件实现。
 static int dst_http_get_file_port(const char* relpath, const char* out_path,
-                                  int port, long resume_from) {
+                                  int port, long resume_from, int pidx) {
     connect_t c = dst_asset_connect();
     if (c == NULL) return -1;
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -1267,13 +1286,19 @@ static int dst_http_get_file_port(const char* relpath, const char* out_path,
 
     time_t deadline = time(NULL) + DST_ASSET_BUDGET;
     long want = (seg_len >= 0) ? (resume_from + seg_len) : -1;  // 期望收齐到的字节数
+    long last_rep = body_total;
     while (want < 0 || body_total < want) {
         int n = recv(sock, buf, sizeof(buf), 0);
         if (n <= 0) break;            // 连接错误或超时 -> 跳出；调用方从上次进度续传
         fwrite(buf, 1, (size_t)n, out);
         body_total += n;
+        if (pidx >= 0) {              // 上报进度（每 ~512KB 写一次，避免频繁 IO）
+            g_prog_cur[pidx] = body_total;
+            if (body_total - last_rep >= 524288) { last_rep = body_total; dst_write_progress_file(); }
+        }
         if (time(NULL) > deadline) { fclose(out); close(sock); return -1; }
     }
+    if (pidx >= 0) { g_prog_cur[pidx] = body_total; dst_write_progress_file(); }
     fflush(out);
     fclose(out);
     close(sock);
@@ -1286,10 +1311,10 @@ static int dst_http_get_file_port(const char* relpath, const char* out_path,
 }
 
 // 依次尝试多个端口（静态资源在 :80 nginx 托管，优先 :80），任一成功即返回 0
-static int dst_http_get_file(const char* relpath, const char* out_path) {
+static int dst_http_get_file(const char* relpath, const char* out_path, int pidx) {
     int ports[] = { 80, 3000 };
     for (int i = 0; i < 2; i++) {
-        if (dst_http_get_file_port(relpath, out_path, ports[i], 0) == 0) return 0;
+        if (dst_http_get_file_port(relpath, out_path, ports[i], 0, pidx) == 0) return 0;
     }
     return -1;
 }
@@ -1343,20 +1368,23 @@ static long dst_http_content_length(const char* relpath) {
 // 网络抖动导致的截断不再整包丢弃，最终收齐才返回 0。max_tries 控制总轮次。
 // 返回 0=收齐并校验完整；-1=超过重试上限仍未收齐。
 static int dst_http_get_file_resume(const char* relpath, const char* out_path,
-                                    long content_total, int max_tries) {
+                                    long content_total, int max_tries, int pidx) {
+    if (pidx >= 0) { g_prog_total[pidx] = content_total; g_prog_cur[pidx] = 0; }
     for (int attempt = 0; attempt < max_tries; attempt++) {
         long have = 0;
         FILE* chk = fopen(out_path, "rb");
         if (chk) { fseek(chk, 0, SEEK_END); have = ftell(chk); fclose(chk); }
+        if (pidx >= 0) { g_prog_cur[pidx] = have; dst_write_progress_file(); }
         if (content_total > 0 && have >= content_total) return 0;  // 已完整
         int rc = -1;
         int ports[] = { 80, 3000 };
         for (int i = 0; i < 2; i++) {
-            if (dst_http_get_file_port(relpath, out_path, ports[i], have) == 0) { rc = 0; break; }
+            if (dst_http_get_file_port(relpath, out_path, ports[i], have, pidx) == 0) { rc = 0; break; }
         }
         if (rc == 0) {
             long after = 0; FILE* c2 = fopen(out_path, "rb");
             if (c2) { fseek(c2, 0, SEEK_END); after = ftell(c2); fclose(c2); }
+            if (pidx >= 0) { g_prog_cur[pidx] = after; dst_write_progress_file(); }
             if (content_total <= 0 || after >= content_total) return 0;
         }
         LOGD("prefetch: %s 续传轮次 %d 未完成，稍后重试", relpath, attempt + 1);
@@ -1411,7 +1439,7 @@ static void* dst_prefetch_worker(void* arg) {
         // 1) 拉服务器版本（直连 IP，不经 Klei 域名，与授权状态无关）
         char server_v[128]; server_v[0] = 0;
         NSString* vtmp = [cacheDir stringByAppendingPathComponent:@"version.tmp"];
-        if (dst_http_get_file("version.txt", [vtmp UTF8String]) == 0) {
+        if (dst_http_get_file("version.txt", [vtmp UTF8String], -1) == 0) {
             FILE* f = fopen([vtmp UTF8String], "r");
             if (f) {
                 if (fgets(server_v, sizeof(server_v), f)) {
@@ -1439,15 +1467,17 @@ static void* dst_prefetch_worker(void* arg) {
         // 3) 两个整包用【断点续传】下载到版本化临时文件（__<ver>.dl），
         //    网络抖动只暂停续传、不整包丢弃（保留文件下启继续）；都收齐+魔数校验才落地。
         //    版本化文件名避免跨版本残留 .dl 污染新版本配对。
+        //    pidx=0/1 让底层下载循环实时上报进度到 progress.txt（Lua 画进度条用）。
         NSArray* names = @[@"scripts.zip", @"images.zip"];
         int ok_all = 1;
-        for (NSString* name in names) {
+        for (NSUInteger idx = 0; idx < names.count; idx++) {
+            NSString* name = names[idx];
             NSString* tmp = [cacheDir stringByAppendingPathComponent:
                 [NSString stringWithFormat:@"__%s.%@.dl", server_v, name]];
             // 先探测整包总长（用于续传收齐判定）
             long ctotal = dst_http_content_length([name UTF8String]);
             LOGD("asset worker: %s 探测总长=%ld", [name UTF8String], ctotal);
-            if (dst_http_get_file_resume([name UTF8String], [tmp UTF8String], ctotal, 12) != 0 ||
+            if (dst_http_get_file_resume([name UTF8String], [tmp UTF8String], ctotal, 12, (int)idx) != 0 ||
                 !dst_zip_ok([tmp UTF8String])) {
                 LOGE("asset worker: %s 续传超限/校验失败 -> 保留 .dl 下启再试", [name UTF8String]);
                 ok_all = 0;
@@ -1476,6 +1506,7 @@ static void* dst_prefetch_worker(void* arg) {
         NSString* flag = [cacheDir stringByAppendingPathComponent:@"ready.flag"];
         FILE* f = fopen([flag UTF8String], "w");
         if (f) { fputs(server_v, f); fputc('\n', f); fclose(f); }
+        [fm removeItemAtPath:[cacheDir stringByAppendingPathComponent:@"progress.txt"] error:nil];
         g_ready_cache = -1;   // 立即失效重定向开关缓存
         LOGD("asset worker: 配对完成 ready.flag=%s（下次启动游戏生效）", server_v);
     } @catch (NSException* e) {
