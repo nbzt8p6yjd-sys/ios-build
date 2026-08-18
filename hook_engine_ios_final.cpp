@@ -1276,43 +1276,64 @@ static void dst_prefetch_assets(void) {
         }
         LOGD("prefetch: 版本 local='%s' server='%s' -> 开始下载整包", local_v, server_v);
 
-        // 2) 逐个下载并覆盖 bundle
-        NSArray* assets = @[@"scripts.zip", @"images.zip"];
-        for (NSString* name in assets) {
-            @try {
-                NSString* tmp = [cacheDir stringByAppendingPathComponent:
-                                 [name stringByAppendingString:@".tmp"]];
-                if (dst_http_get_file([name UTF8String], [tmp UTF8String]) != 0) {
-                    LOGE("prefetch: 下载失败 %s", [name UTF8String]);
-                    continue;
-                }
-                // PK 魔数校验
+        // 2) 逐个处理：先尝试从服务器下载到 cache（不碰只读 bundle），
+//    再兜底——若 cache 缺失则从 bundle 自身复制，确保重定向目标永远存在
+//    （参考包 mods_fs 同款鲁棒性：enhanced zip 永远本地存在，网络只是叠加层）
+NSArray* assets = @[@"scripts.zip", @"images.zip"];
+NSFileManager* fm = [NSFileManager defaultManager];
+for (NSString* name in assets) {
+    @try {
+        NSString* cachePath  = [cacheDir stringByAppendingPathComponent:name];
+        NSString* bundlePath = [bundleDB stringByAppendingPathComponent:name];
+
+        // (a) 需要且能下载 -> 下载到 cache（不再覆盖 bundle）
+        if (need_dl) {
+            NSString* tmp = [cacheDir stringByAppendingPathComponent:
+                             [name stringByAppendingString:@".tmp"]];
+            if (dst_http_get_file([name UTF8String], [tmp UTF8String]) == 0) {
                 unsigned char sig[4] = {0};
                 FILE* vf = fopen([tmp UTF8String], "rb");
                 int ok = (vf && fread(sig, 1, 4, vf) == 4);
                 if (vf) fclose(vf);
-                if (!ok || !(sig[0]=='P' && sig[1]=='K' && sig[2]==0x03 && sig[3]==0x04)) {
-                    LOGE("prefetch: %s 非合法 zip（魔数错误）-> 跳过", [name UTF8String]);
-                    [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-                    continue;
+                if (ok && sig[0]=='P' && sig[1]=='K' && sig[2]==0x03 && sig[3]==0x04) {
+                    [fm removeItemAtPath:cachePath error:nil];
+                    if ([fm moveItemAtPath:tmp toPath:cachePath error:nil]) {
+                        LOGD("prefetch: %s 下载成功 -> cache", [name UTF8String]);
+                    } else {
+                        LOGE("prefetch: %s 移入 cache 失败", [name UTF8String]);
+                    }
+                } else {
+                    LOGE("prefetch: %s 非合法 zip（魔数错误）-> 丢弃", [name UTF8String]);
+                    [fm removeItemAtPath:tmp error:nil];
                 }
-                NSFileManager* fm = [NSFileManager defaultManager];
-                NSString* dest = [bundleDB stringByAppendingPathComponent:name];
-                NSString* bak  = [bundleDB stringByAppendingPathComponent:
-                                  [name stringByAppendingString:@".bak"]];
-                [fm removeItemAtPath:bak error:nil];
-                [fm moveItemAtPath:dest toPath:bak error:nil];
-                NSError* err = nil;
-                if (![fm moveItemAtPath:tmp toPath:dest error:&err]) {
-                    LOGD("prefetch: 覆盖 %s 失败(只读bundle, 由 open 重定向兜底): %s", [name UTF8String], [[err description] UTF8String]);
-                    [fm moveItemAtPath:bak toPath:dest error:nil];
-                    continue;
-                }
-                LOGD("prefetch: %s 已更新 -> %s", [name UTF8String], [dest UTF8String]);
-            } @catch (NSException* e) {
-                LOGE("prefetch 循环异常: %s", [[e description] UTF8String]);
+            } else {
+                LOGE("prefetch: %s 服务器下载失败（将走离线兜底）", [name UTF8String]);
             }
         }
+
+        // (b) 兜底：cache 缺失则从 bundle 自身复制（保证重定向目标存在）
+        if (![fm fileExistsAtPath:cachePath]) {
+            if ([fm fileExistsAtPath:bundlePath]) {
+                if ([fm copyItemAtPath:bundlePath toPath:cachePath error:nil]) {
+                    LOGD("prefetch: %s 离线兜底（bundle -> cache）", [name UTF8String]);
+                } else {
+                    LOGE("prefetch: %s 兜底复制失败", [name UTF8String]);
+                }
+            } else {
+                LOGE("prefetch: %s 既无 cache 也无 bundle 源", [name UTF8String]);
+            }
+        }
+
+        // (c) 最终确认
+        if ([fm fileExistsAtPath:cachePath]) {
+            LOGD("prefetch: %s 就绪 -> %s", [name UTF8String], [cachePath UTF8String]);
+        } else {
+            LOGE("prefetch: %s 仍缺失（重定向将失效！）", [name UTF8String]);
+        }
+    } @catch (NSException* e) {
+        LOGE("prefetch 循环异常(%s): %s", [name UTF8String], [[e description] UTF8String]);
+    }
+}
         dst_write_local_version(server_v);
         LOGD("prefetch: 完成，本地版本=%s", server_v);
     } @catch (NSException* e) {
