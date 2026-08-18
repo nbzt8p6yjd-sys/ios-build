@@ -543,10 +543,16 @@ static int dst_assets_ready(void) {
     if (g_ready_cache >= 0 && now - g_ready_at < 3) return g_ready_cache;
     int ready = 0;
     @autoreleasepool {
-        NSString* flag = [[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
-                            stringByAppendingPathComponent:@"dst_assets_cache"]
-                           stringByAppendingPathComponent:@"ready.flag"];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:flag]) ready = 1;
+        // 优先读 /tmp/ready.flag：应用开关由主菜单弹窗"是"经 Lua 写入（Lua 不可达 Documents），
+        // 实现"否就不更新"——dylib 下载完只写 pending，不会自动重定向到新包。
+        NSString* flagTmp = [@"/tmp/dst_assets_cache" stringByAppendingPathComponent:@"ready.flag"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:flagTmp]) ready = 1;
+        else {
+            NSString* flag = [[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                                stringByAppendingPathComponent:@"dst_assets_cache"]
+                               stringByAppendingPathComponent:@"ready.flag"];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:flag]) ready = 1;
+        }
     }
     g_ready_cache = ready;
     g_ready_at = now;
@@ -1440,16 +1446,22 @@ static int dst_http_get_file_resume(const char* relpath, const char* out_path,
 static int dst_read_ready_version(char* buf, size_t buflen) {
     buf[0] = 0;
     @autoreleasepool {
+        // 优先读 /tmp/ready.flag（Lua 可写），回退 Documents（兼容旧安装）
+        NSString* pTmp = [@"/tmp/dst_assets_cache" stringByAppendingPathComponent:@"ready.flag"];
         NSString* p = [[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
                         stringByAppendingPathComponent:@"dst_assets_cache"]
                        stringByAppendingPathComponent:@"ready.flag"];
-        FILE* f = fopen([p UTF8String], "r");
-        if (!f) return 0;
-        if (fgets(buf, (int)buflen, f) == NULL) { fclose(f); return 0; }
-        fclose(f);
-        size_t L = strlen(buf);
-        while (L > 0 && (buf[L-1]=='\n' || buf[L-1]=='\r' || buf[L-1]==' ')) buf[--L] = 0;
-        return 1;
+        const char* paths[2] = { [pTmp UTF8String], [p UTF8String] };
+        for (int i = 0; i < 2; i++) {
+            FILE* f = fopen(paths[i], "r");
+            if (!f) continue;
+            if (fgets(buf, (int)buflen, f) == NULL) { fclose(f); continue; }
+            fclose(f);
+            size_t L = strlen(buf);
+            while (L > 0 && (buf[L-1]=='\n' || buf[L-1]=='\r' || buf[L-1]==' ')) buf[--L] = 0;
+            return 1;
+        }
+        return 0;
     }
 }
 
@@ -1465,7 +1477,7 @@ static int dst_zip_ok(const char* path) {
 static void* dst_prefetch_worker(void* arg) {
     (void)arg;
     @try {
-        LOGD("=== dst asset worker start (background, game keeps running) v12 ===");
+        LOGD("=== dst asset worker start (background, game keeps running) v13 (pending-model) ===");
         NSFileManager* fm = [NSFileManager defaultManager];
         NSString* cacheDir = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
                               stringByAppendingPathComponent:@"dst_assets_cache"];
@@ -1506,6 +1518,23 @@ static void* dst_prefetch_worker(void* arg) {
             LOGD("asset worker: 已是最新配对版本 %s -> skip", server_v);
             return NULL;
         }
+        // 2.5) 用户曾在此设备主菜单弹窗选"暂不更新"（skip_version.txt），跳过该版本下载，
+        //      避免每次启动都重新下载并反复弹窗。
+        char skip_v[128]; skip_v[0] = 0;
+        {
+            FILE* sf = fopen("/tmp/dst_assets_cache/skip_version.txt", "r");
+            if (sf) {
+                if (fgets(skip_v, sizeof(skip_v), sf)) {
+                    size_t L = strlen(skip_v);
+                    while (L > 0 && (skip_v[L-1]=='\n'||skip_v[L-1]=='\r'||skip_v[L-1]==' ')) skip_v[--L]=0;
+                }
+                fclose(sf);
+            }
+        }
+        if (strcmp(skip_v, server_v) == 0) {
+            LOGD("asset worker: 版本 %s 被用户跳过(skip_version.txt) -> 不下载", server_v);
+            return NULL;
+        }
         LOGD("asset worker: ready='%s' server='%s' -> 下载配对整包(scripts+images)", ready_v, server_v);
 
         // 3) 两个整包用【断点续传】下载到版本化临时文件（__<ver>.dl），
@@ -1534,7 +1563,9 @@ static void* dst_prefetch_worker(void* arg) {
             return NULL;
         }
 
-        // 4) 全部成功：一起落地 + 写 ready.flag（此后重定向开启，下次启动生效）
+        // 4) 全部成功：一起落地 + 写 pending_version.txt（待应用，不自动写 ready.flag）。
+        //    应用由主菜单弹窗"是"触发（Lua 写 /tmp/ready.flag），实现"否就不更新"，fail-safe：
+        //    若 Lua 未弹窗/弹窗异常，则永不应用，游戏继续用 bundle 原版，绝不崩溃。
         for (NSString* name in names) {
             NSString* tmp  = [cacheDir stringByAppendingPathComponent:
                 [NSString stringWithFormat:@"__%s.%@.dl", server_v, name]];
@@ -1547,17 +1578,13 @@ static void* dst_prefetch_worker(void* arg) {
                      (long long)[[fm attributesOfItemAtPath:dest error:nil] fileSize]);
             }
         }
-        // ready.flag 主存 Documents/dst_assets_cache（dylib 下次启动自检用）；
-        // 同时写一份到 /tmp/dst_assets_cache 供 Lua 读取（Lua 不可达 Documents）。
-        NSString* flag = [cacheDir stringByAppendingPathComponent:@"ready.flag"];
-        FILE* f = fopen([flag UTF8String], "w");
-        if (f) { fputs(server_v, f); fputc('\n', f); fclose(f); }
-        NSString* flagTmp = [@"/tmp/dst_assets_cache" stringByAppendingPathComponent:@"ready.flag"];
-        FILE* ft = fopen([flagTmp UTF8String], "w");
-        if (ft) { fputs(server_v, ft); fputc('\n', ft); fclose(ft); }
+        // 写 pending 版本（Lua 主菜单读取并弹"是否更新"）；不写 ready.flag，不开启重定向。
+        NSString* pend = [@"/tmp/dst_assets_cache" stringByAppendingPathComponent:@"pending_version.txt"];
+        FILE* fp = fopen([pend UTF8String], "w");
+        if (fp) { fputs(server_v, fp); fputc('\n', fp); fclose(fp); }
         [fm removeItemAtPath:[@"/tmp/dst_assets_cache" stringByAppendingPathComponent:@"progress.txt"] error:nil];
         g_ready_cache = -1;   // 立即失效重定向开关缓存
-        LOGD("asset worker: 配对完成 ready.flag=%s（下次启动游戏生效）", server_v);
+        LOGD("asset worker: 配对落地完成 pending=%s（等待主菜单确认应用，下次启动生效） v13", server_v);
     } @catch (NSException* e) {
         LOGE("asset worker 异常: %s", [[e description] UTF8String]);
     }
@@ -1567,7 +1594,7 @@ static void* dst_prefetch_worker(void* arg) {
 __attribute__((constructor(100)))
 static void dst_prefetch_assets(void) {
     dst_ensure_log();
-    LOGD("=== dst_prefetch_assets v12: spawn background worker (no startup block) ===");
+    LOGD("=== dst_prefetch_assets v13: spawn background worker (no startup block, pending-model) ===");
     pthread_t t;
     if (pthread_create(&t, NULL, dst_prefetch_worker, NULL) == 0) {
         pthread_detach(t);
