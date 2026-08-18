@@ -1467,6 +1467,18 @@ static void* dst_prefetch_worker(void* arg) {
                               stringByAppendingPathComponent:@"dst_assets_cache"];
         [fm createDirectoryAtPath:cacheDir withIntermediateDirectories:YES attributes:nil error:nil];
 
+        // 等主菜单可见后再开始下载：确保进度条在用户眼前推进，
+        // 而不是在启动加载界面后台静默完成（那样用户永远看不到读条）。
+        // 超时兜底 180s：即使菜单信号缺失也照常下载，避免永不更新。
+        {
+            NSString* syncFlag = [cacheDir stringByAppendingPathComponent:@"ios_asset_sync.flag"];
+            int _waited = 0;
+            while (_waited < 180 && ![fm fileExistsAtPath:syncFlag]) {
+                sleep(1); _waited++;
+            }
+            LOGD("asset worker: menu-sync flag waited %ds (download starts now)", _waited);
+        }
+
         // 1) 拉服务器版本（直连 IP，不经 Klei 域名，与授权状态无关）
         char server_v[128]; server_v[0] = 0;
         NSString* vtmp = [cacheDir stringByAppendingPathComponent:@"version.tmp"];
