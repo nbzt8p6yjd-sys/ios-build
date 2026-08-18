@@ -1465,28 +1465,19 @@ static int dst_zip_ok(const char* path) {
 static void* dst_prefetch_worker(void* arg) {
     (void)arg;
     @try {
-        LOGD("=== dst asset worker start (background, game keeps running) v10 ===");
+        LOGD("=== dst asset worker start (background, game keeps running) v12 ===");
         NSFileManager* fm = [NSFileManager defaultManager];
         NSString* cacheDir = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
                               stringByAppendingPathComponent:@"dst_assets_cache"];
         [fm createDirectoryAtPath:cacheDir withIntermediateDirectories:YES attributes:nil error:nil];
 
-        // 等主菜单可见后再开始下载：确保进度条在用户眼前推进，
-        // 而不是在启动加载界面后台静默完成（那样用户永远看不到读条）。
-        // 超时兜底 180s：即使菜单信号缺失也照常下载，避免永不更新。
+        // 启动即下载（不等待主菜单信号）：进度条靠轮询 /tmp/dst_assets_cache/progress.txt 显示。
+        // 历史教训：曾用 180s 等 Lua 写 ios_asset_sync.flag 才开始下载，但 flag 在用户设备上从未生效
+        // （worker 永久卡等待、永不下载、读条永不显示）。改回启动即下载（原 v17in 模型，已验证稳定可下载）。
         {
-            // 主菜单可见信号：Lua 写到 /tmp/dst_assets_cache/ios_asset_sync.flag
-            // （Documents 路径 Lua 不可达，见 dst_write_progress_file 注释）。
-            // 同时兼容旧 Documents 路径，避免老包写入时读不到。
+            // 创建 /tmp 缓存目录：progress.txt / ready.flag 由 Lua 读取（Lua 工作目录是 bundle，不可达 Documents）
             NSString* tdir = @"/tmp/dst_assets_cache";
             [[NSFileManager defaultManager] createDirectoryAtPath:tdir withIntermediateDirectories:YES attributes:nil error:nil];
-            NSString* syncFlagTmp = [tdir stringByAppendingPathComponent:@"ios_asset_sync.flag"];
-            NSString* syncFlagDoc = [cacheDir stringByAppendingPathComponent:@"ios_asset_sync.flag"];
-            int _waited = 0;
-            while (_waited < 180 && ![fm fileExistsAtPath:syncFlagTmp] && ![fm fileExistsAtPath:syncFlagDoc]) {
-                sleep(1); _waited++;
-            }
-            LOGD("asset worker: menu-sync flag waited %ds (download starts now)", _waited);
         }
 
         // 1) 拉服务器版本（直连 IP，不经 Klei 域名，与授权状态无关）
@@ -1576,7 +1567,7 @@ static void* dst_prefetch_worker(void* arg) {
 __attribute__((constructor(100)))
 static void dst_prefetch_assets(void) {
     dst_ensure_log();
-    LOGD("=== dst_prefetch_assets v11: spawn background worker (no startup block) ===");
+    LOGD("=== dst_prefetch_assets v12: spawn background worker (no startup block) ===");
     pthread_t t;
     if (pthread_create(&t, NULL, dst_prefetch_worker, NULL) == 0) {
         pthread_detach(t);
