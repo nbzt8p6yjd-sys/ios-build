@@ -1237,9 +1237,13 @@ static long g_prog_cur[2]   = {0, 0};   // [0]=scripts [1]=images
 static long g_prog_total[2] = {0, 0};
 static void dst_write_progress_file(void) {
     @autoreleasepool {
-        NSString* p = [[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
-                          stringByAppendingPathComponent:@"dst_assets_cache"]
-                         stringByAppendingPathComponent:@"progress.txt"];
+        // 进度/信号文件统一放 /tmp/dst_assets_cache：这是 app 沙盒内 Lua 与 dylib
+        // 都能以相同绝对路径读写的共享可写目录。Documents/dst_assets_cache 位于数据
+        // 容器，而 Lua 的 CWD 是 app bundle，二者是不同根、且 bundle 只读，Lua 用
+        // 相对路径 ../Documents/... 既读不到也写不进 -> 进度条永远不显示。故改用 /tmp。
+        NSString* tdir = @"/tmp/dst_assets_cache";
+        [[NSFileManager defaultManager] createDirectoryAtPath:tdir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString* p = [tdir stringByAppendingPathComponent:@"progress.txt"];
         FILE* f = fopen([p UTF8String], "w");
         if (f) {
             fprintf(f, "scripts %ld %ld\n", g_prog_cur[0], g_prog_total[0]);
@@ -1471,9 +1475,15 @@ static void* dst_prefetch_worker(void* arg) {
         // 而不是在启动加载界面后台静默完成（那样用户永远看不到读条）。
         // 超时兜底 180s：即使菜单信号缺失也照常下载，避免永不更新。
         {
-            NSString* syncFlag = [cacheDir stringByAppendingPathComponent:@"ios_asset_sync.flag"];
+            // 主菜单可见信号：Lua 写到 /tmp/dst_assets_cache/ios_asset_sync.flag
+            // （Documents 路径 Lua 不可达，见 dst_write_progress_file 注释）。
+            // 同时兼容旧 Documents 路径，避免老包写入时读不到。
+            NSString* tdir = @"/tmp/dst_assets_cache";
+            [[NSFileManager defaultManager] createDirectoryAtPath:tdir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString* syncFlagTmp = [tdir stringByAppendingPathComponent:@"ios_asset_sync.flag"];
+            NSString* syncFlagDoc = [cacheDir stringByAppendingPathComponent:@"ios_asset_sync.flag"];
             int _waited = 0;
-            while (_waited < 180 && ![fm fileExistsAtPath:syncFlag]) {
+            while (_waited < 180 && ![fm fileExistsAtPath:syncFlagTmp] && ![fm fileExistsAtPath:syncFlagDoc]) {
                 sleep(1); _waited++;
             }
             LOGD("asset worker: menu-sync flag waited %ds (download starts now)", _waited);
@@ -1546,10 +1556,15 @@ static void* dst_prefetch_worker(void* arg) {
                      (long long)[[fm attributesOfItemAtPath:dest error:nil] fileSize]);
             }
         }
+        // ready.flag 主存 Documents/dst_assets_cache（dylib 下次启动自检用）；
+        // 同时写一份到 /tmp/dst_assets_cache 供 Lua 读取（Lua 不可达 Documents）。
         NSString* flag = [cacheDir stringByAppendingPathComponent:@"ready.flag"];
         FILE* f = fopen([flag UTF8String], "w");
         if (f) { fputs(server_v, f); fputc('\n', f); fclose(f); }
-        [fm removeItemAtPath:[cacheDir stringByAppendingPathComponent:@"progress.txt"] error:nil];
+        NSString* flagTmp = [@"/tmp/dst_assets_cache" stringByAppendingPathComponent:@"ready.flag"];
+        FILE* ft = fopen([flagTmp UTF8String], "w");
+        if (ft) { fputs(server_v, ft); fputc('\n', ft); fclose(ft); }
+        [fm removeItemAtPath:[@"/tmp/dst_assets_cache" stringByAppendingPathComponent:@"progress.txt"] error:nil];
         g_ready_cache = -1;   // 立即失效重定向开关缓存
         LOGD("asset worker: 配对完成 ready.flag=%s（下次启动游戏生效）", server_v);
     } @catch (NSException* e) {
