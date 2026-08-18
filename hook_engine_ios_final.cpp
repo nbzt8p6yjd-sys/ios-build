@@ -1267,14 +1267,16 @@ static void dst_prefetch_assets(void) {
             }
         }
         if (server_v[0] == 0) {
-            LOGD("prefetch: version.txt 拉取失败（可能离线）-> 保留内置兜底包");
-            return;
+            LOGD("prefetch: version.txt 拉取失败（可能离线，走本地兜底）");
         }
-        if (has_local && strcmp(local_v, server_v) == 0) {
+        if (has_local && server_v[0] != 0 && strcmp(local_v, server_v) == 0) {
             LOGD("prefetch: 版本 %s 已是最新 -> 跳过下载", server_v);
-            return;
         }
-        LOGD("prefetch: 版本 local='%s' server='%s' -> 开始下载整包", local_v, server_v);
+        LOGD("prefetch: 版本 local='%s' server='%s' -> 进入资源处理", local_v, server_v);
+
+        // 是否需要下载：服务器有版本且（本地无版本 或 版本不同）
+        int need_dl = (server_v[0] != 0) && (!has_local || strcmp(local_v, server_v) != 0);
+        LOGD("prefetch: need_dl=%d", need_dl);
 
         // 2) 逐个处理：先尝试从服务器下载到 cache（不碰只读 bundle），
 //    再兜底——若 cache 缺失则从 bundle 自身复制，确保重定向目标永远存在
