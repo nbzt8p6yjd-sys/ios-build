@@ -229,18 +229,38 @@ static void rewrite_cluster_token_on_close() {
 static const char* g_dst_db_names[]={"scripts.zip","images.zip"};
 static char g_dst_redirect_buf[1024];
 static int g_ready_cache=-1; static time_t g_ready_at=0;
+// 前向声明
+static NSString* dst_get_cache_dir();
 static int dst_assets_ready(void) {
     time_t now=time(NULL);
     if(g_ready_cache>=0 && now-g_ready_at<3) return g_ready_cache;
     int ready=0;
     @autoreleasepool {
-        NSString* ft=@"/tmp/dst_assets_cache/ready.flag";
-        if([[NSFileManager defaultManager] fileExistsAtPath:ft]) ready=1;
-        else { NSString* f=[[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:@"dst_assets_cache"] stringByAppendingPathComponent:@"ready.flag"];
-            if([[NSFileManager defaultManager] fileExistsAtPath:f]) ready=1; }
+        NSString* f=[dst_get_cache_dir() stringByAppendingPathComponent:@"ready.flag"];
+        if([[NSFileManager defaultManager] fileExistsAtPath:f]) ready=1;
     }
     g_ready_cache=ready; g_ready_at=now; return ready;
 }
+// 重定向 ../Documents/ 相对路径到沙箱 Documents 绝对路径
+// Lua 的 io.open 底层调用 fopen，CWD = bundle data/（只读），
+// ../Documents/ 解析到 bundle 内（只读），需要重定向到沙箱 Documents
+static char g_lua_redirect_buf[1024];
+static const char* dst_redirect_lua_path(const char* path) {
+    if(!path) return path;
+    // 检查是否是 ../Documents/... 路径
+    if(strncmp(path, "../Documents/", 13) != 0) return path;
+    @autoreleasepool {
+        NSString* rel = [NSString stringWithUTF8String:path+13]; // 跳过 ../Documents/
+        NSString* abs = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:rel];
+        if([[NSFileManager defaultManager] fileExistsAtPath:abs]) {
+            strncpy(g_lua_redirect_buf, [abs UTF8String], 1023);
+            g_lua_redirect_buf[1023] = 0;
+            return g_lua_redirect_buf;
+        }
+    }
+    return path;
+}
+
 static const char* dst_redirect_databundle(const char* path) {
     if(!path) return path;
     const char* base=strrchr(path,'/'); base=base?base+1:path;
@@ -249,7 +269,7 @@ static const char* dst_redirect_databundle(const char* path) {
     if(!dst_assets_ready()) return path;
     @autoreleasepool {
         NSString* nm=[NSString stringWithUTF8String:base];
-        NSString* cache=[[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:@"dst_assets_cache"] stringByAppendingPathComponent:nm];
+        NSString* cache=[dst_get_cache_dir() stringByAppendingPathComponent:nm];
         if([[NSFileManager defaultManager] fileExistsAtPath:cache]) {
             strncpy(g_dst_redirect_buf,[cache UTF8String],1023); g_dst_redirect_buf[1023]=0; return g_dst_redirect_buf;
         }
@@ -262,25 +282,25 @@ static const char* dst_redirect_databundle(const char* path) {
 // ---- file hooks ----
 static int fake_open(const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode);
-    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token(path,orig_open); g_open_reent=0;}
     int fd=orig_open?orig_open(path,flags,mode):open(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
 static int fake_open_nocancel(const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode); open_t real=orig_open_nocancel?orig_open_nocancel:orig_open;
-    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=real(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=real(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=real(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token(path,real); g_open_reent=0;}
     int fd=real(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
 static int fake_openat(int dirfd,const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode);
-    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token_at(path,dirfd,orig_openat); g_open_reent=0;}
     int fd=orig_openat?orig_openat(dirfd,path,flags,mode):openat(dirfd,path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
 static int fake_openat_nocancel(int dirfd,const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode); openat_t real=orig_openat_nocancel?orig_openat_nocancel:orig_openat;
-    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token_at(path,dirfd,real); g_open_reent=0;}
     int fd=real(dirfd,path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
@@ -292,7 +312,10 @@ static int fake_renameat(int oldfd,const char* oldp,int newfd,const char* newp) 
 // ---- C-stdio ----
 static FILE* g_tok_wfile=NULL;
 static FILE* fake_fopen(const char* path,const char* mode) {
-    if(!g_open_reent && mode && mode[0]=='r' && !strchr(mode,'+')) { const char* red=dst_redirect_databundle(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode); }
+    if(!g_open_reent && mode && mode[0]=='r' && !strchr(mode,'+')) {
+        const char* red=dst_redirect_databundle(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+        red=dst_redirect_lua_path(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+    }
     FILE* f=orig_fopen?orig_fopen(path,mode):fopen(path,mode);
     if(f&&!g_open_reent&&path&&path_is_cluster_token(path)&&mode&&(strchr(mode,'w')||strchr(mode,'a')||strchr(mode,'+'))) { g_tok_wfile=f; strncpy(g_tok_wpath,path,511); g_tok_wpath[511]=0; }
     return f;
