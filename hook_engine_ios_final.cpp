@@ -598,6 +598,25 @@ static void* dst_asset_worker(void* arg) {
             sleep(3);
             poll_count++;
 
+            // 检查是否有删除请求
+            char del_req[16];
+            int dlen = dst_read_cache_file("delete_request.txt", del_req, sizeof(del_req));
+            if (dlen > 0 && del_req[0] != 0) {
+                LOGD("asset worker: delete request received");
+                dst_remove_cache_file("delete_request.txt");
+                dst_remove_cache_file("ready.flag");
+                dst_remove_cache_file("pending_version.txt");
+                dst_remove_cache_file("progress.txt");
+                dst_remove_cache_file("skip_version.txt");
+                dst_remove_cache_file("download_request.txt");
+                dst_remove_cache_file("version.txt");
+                dst_remove_cache_file("scripts.zip");
+                dst_remove_cache_file("images.zip");
+                dst_remove_cache_file("versions.json");
+                g_ready_cache = -1; // 清除缓存
+                LOGD("asset worker: all cache files deleted");
+            }
+
             // 检查是否有下载请求
             char req_ver[256];
             int rlen = dst_read_cache_file("download_request.txt", req_ver, sizeof(req_ver));
