@@ -117,8 +117,8 @@ typedef FILE* (*fopen_t)(const char*, const char*);
 typedef int (*fclose_t)(FILE*);
 
 static connect_t orig_connect=NULL; static sendto_t orig_sendto=NULL; static bind_t orig_bind=NULL;
-static open_t orig_open=NULL,*orig_open_nocancel_ptr=NULL; static openat_t orig_openat=NULL,*orig_openat_nocancel_ptr=NULL;
-static close_t orig_close=NULL, orig_close_nocancel=NULL;
+static open_t orig_open=NULL;
+static close_t orig_close=NULL; static close_t orig_close_nocancel=NULL;
 static rename_t orig_rename=NULL; static renameat_t orig_renameat=NULL;
 static gethostbyname_t orig_gethostbyname=NULL; static getaddrinfo_t orig_getaddrinfo=NULL;
 static fopen_t orig_fopen=NULL; static fclose_t orig_fclose=NULL;
