@@ -396,7 +396,7 @@ static NSString* dst_get_cache_dir() {
     static NSString* cacheDir = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        cacheDir = [[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:@"dst_assets_cache"] retain];
+        cacheDir = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:@"dst_assets_cache"];
     });
     return cacheDir;
 }
