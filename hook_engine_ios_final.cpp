@@ -391,12 +391,14 @@ static void dst_online_ctor() { dst_online_init(); }
 #define DST_API_BASE     "/api"
 #define DST_ASSET_CONN_TO  12
 #define DST_ASSET_BUDGET   300
-// Documents/dst_assets_cache — DST Lua 的 io.open 可以读这个路径
+// Documents/DoNotStarveTogether/client_save — DST 引擎自己创建的目录，Lua io.open 一定能读
 static NSString* dst_get_cache_dir() {
     static NSString* cacheDir = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        cacheDir = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:@"dst_assets_cache"];
+        cacheDir = [[[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+            stringByAppendingPathComponent:@"DoNotStarveTogether"] stringByAppendingPathComponent:@"client_save"]
+            stringByAppendingPathComponent:@"dst_assets_cache"];
     });
     return cacheDir;
 }
