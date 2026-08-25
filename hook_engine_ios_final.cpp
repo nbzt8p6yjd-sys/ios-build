@@ -391,7 +391,15 @@ static void dst_online_ctor() { dst_online_init(); }
 #define DST_API_BASE     "/api"
 #define DST_ASSET_CONN_TO  12
 #define DST_ASSET_BUDGET   300
-static const char* DST_TMP_CACHE = "/tmp/dst_assets_cache";
+// Documents/dst_assets_cache — DST Lua 的 io.open 可以读这个路径
+static NSString* dst_get_cache_dir() {
+    static NSString* cacheDir = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cacheDir = [[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:@"dst_assets_cache"] retain];
+    });
+    return cacheDir;
+}
 
 // 用 orig_connect 直连（绕过 fishhook，不触发 SIGSEGV）
 static int dst_asset_http_get(const char* host, int port, const char* path, char* buf, int buflen) {
@@ -486,10 +494,10 @@ static int dst_asset_download_file(const char* host, int port, const char* path,
     return 0;
 }
 
-// 写文件到 /tmp/dst_assets_cache/
+// 写文件到 Documents/dst_assets_cache/
 static void dst_write_cache_file(const char* name, const char* content, int len) {
     @autoreleasepool {
-        NSString* dir = [NSString stringWithUTF8String:DST_TMP_CACHE];
+        NSString* dir = dst_get_cache_dir();
         [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
         NSString* path = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
         FILE* f = fopen([path UTF8String], "wb");
@@ -497,10 +505,10 @@ static void dst_write_cache_file(const char* name, const char* content, int len)
     }
 }
 
-// 读 /tmp/dst_assets_cache/ 文件
+// 读 Documents/dst_assets_cache/ 文件
 static int dst_read_cache_file(const char* name, char* buf, int buflen) {
     @autoreleasepool {
-        NSString* path = [[NSString stringWithUTF8String:DST_TMP_CACHE] stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+        NSString* path = [dst_get_cache_dir() stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
         FILE* f = fopen([path UTF8String], "r");
         if (!f) return -1;
         int n = (int)fread(buf, 1, (size_t)buflen - 1, f);
@@ -513,14 +521,14 @@ static int dst_read_cache_file(const char* name, char* buf, int buflen) {
 
 static int dst_cache_file_exists(const char* name) {
     @autoreleasepool {
-        NSString* path = [[NSString stringWithUTF8String:DST_TMP_CACHE] stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+        NSString* path = [dst_get_cache_dir() stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
         return [[NSFileManager defaultManager] fileExistsAtPath:path] ? 1 : 0;
     }
 }
 
 static void dst_remove_cache_file(const char* name) {
     @autoreleasepool {
-        NSString* path = [[NSString stringWithUTF8String:DST_TMP_CACHE] stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+        NSString* path = [dst_get_cache_dir() stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
         [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
     }
 }
@@ -576,12 +584,12 @@ static void* dst_asset_worker(void* arg) {
                     dst_write_cache_file("progress.txt", prog, 0);
 
                     @autoreleasepool {
-                        NSString* dir = [NSString stringWithUTF8String:DST_TMP_CACHE];
+                        NSString* dir = dst_get_cache_dir();
                         [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
                     }
 
                     char out_path[512];
-                    snprintf(out_path, sizeof(out_path), "%s/%s", DST_TMP_CACHE, assets[i]);
+                    snprintf(out_path, sizeof(out_path), "%s/%s", [dst_get_cache_dir() UTF8String], assets[i]);
 
                     int port = 3000;
                     int rc = dst_asset_download_file(DST_ASSET_HOST, port, dl_path, out_path);
@@ -611,7 +619,7 @@ static void* dst_asset_worker(void* arg) {
                     // 读 version.txt 获取版本号
                     char ver_str[128]; ver_str[0] = 0;
                     char ver_path[512];
-                    snprintf(ver_path, sizeof(ver_path), "%s/version.txt", DST_TMP_CACHE);
+                    snprintf(ver_path, sizeof(ver_path), "%s/version.txt", [dst_get_cache_dir() UTF8String]);
                     FILE* vf = fopen(ver_path, "r");
                     if (vf) { fgets(ver_str, sizeof(ver_str), vf); fclose(vf);
                         size_t L = strlen(ver_str);
