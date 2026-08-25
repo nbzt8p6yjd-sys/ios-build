@@ -123,6 +123,7 @@ static rename_t orig_rename=NULL; static renameat_t orig_renameat=NULL;
 static gethostbyname_t orig_gethostbyname=NULL; static getaddrinfo_t orig_getaddrinfo=NULL;
 static fopen_t orig_fopen=NULL; static fclose_t orig_fclose=NULL;
 static open_t orig_open_nocancel=NULL;
+static openat_t orig_openat=NULL;
 static openat_t orig_openat_nocancel=NULL;
 static BOOL (*orig_NSData_wtf)(id,SEL,NSString*,BOOL)=NULL;
 static BOOL (*orig_NSString_wtf)(id,SEL,NSString*,BOOL,NSStringEncoding,NSError**)=NULL;
