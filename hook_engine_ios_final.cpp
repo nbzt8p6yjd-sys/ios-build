@@ -163,12 +163,19 @@ static void dst_resolve_and_interpose() {
     orig_fopen=(fopen_t)fopen; orig_fclose=(fclose_t)fclose;
     dst_ensure_log(); LOGD("originals resolved");
     struct rebinding rebinds[]={
-        {"connect",fake_connect,&orig_connect},{"sendto",fake_sendto,&orig_sendto},{"bind",fake_bind,&orig_bind},
-        {"gethostbyname",fake_gethostbyname,&orig_gethostbyname},{"getaddrinfo",fake_getaddrinfo,&orig_getaddrinfo},
-        {"X509_verify_cert",fake_X509_verify_cert,&orig_X509_verify_cert},
-        {"open",fake_open,&orig_open},{"open$NOCANCEL",fake_open_nocancel,&orig_open_nocancel},
-        {"openat",fake_openat,&orig_openat},{"openat$NOCANCEL",fake_openat_nocancel,&orig_openat_nocancel},
-        {"fopen",fake_fopen,&orig_fopen},{"rename",fake_rename,&orig_rename},{"renameat",fake_renameat,&orig_renameat},
+        {"connect",(void*)fake_connect,(void**)&orig_connect},
+        {"sendto",(void*)fake_sendto,(void**)&orig_sendto},
+        {"bind",(void*)fake_bind,(void**)&orig_bind},
+        {"gethostbyname",(void*)fake_gethostbyname,(void**)&orig_gethostbyname},
+        {"getaddrinfo",(void*)fake_getaddrinfo,(void**)&orig_getaddrinfo},
+        {"X509_verify_cert",(void*)fake_X509_verify_cert,(void**)&orig_X509_verify_cert},
+        {"open",(void*)fake_open,(void**)&orig_open},
+        {"open$NOCANCEL",(void*)fake_open_nocancel,(void**)&orig_open_nocancel},
+        {"openat",(void*)fake_openat,(void**)&orig_openat},
+        {"openat$NOCANCEL",(void*)fake_openat_nocancel,(void**)&orig_openat_nocancel},
+        {"fopen",(void*)fake_fopen,(void**)&orig_fopen},
+        {"rename",(void*)fake_rename,(void**)&orig_rename},
+        {"renameat",(void*)fake_renameat,(void**)&orig_renameat},
     };
     rebind_symbols(rebinds,sizeof(rebinds)/sizeof(rebinds[0]));
     LOGD("fishhook rebind done");
