@@ -377,6 +377,278 @@ static void dst_online_init() { if(g_relay_ip==0) g_relay_ip=inet_addr(DST_RELAY
 __attribute__((constructor(100)))
 static void dst_online_ctor() { dst_online_init(); }
 
+// ============ v12 动态资产：后台下载 + 版本选择（dylib↔Lua 通过文件通信）============
+// 通信机制：
+//   dylib -> Lua:  /tmp/dst_assets_cache/versions.json    （版本列表）
+//                   /tmp/dst_assets_cache/progress.txt     （下载进度）
+//                   /tmp/dst_assets_cache/pending_version.txt（下载完成待应用）
+//   Lua -> dylib:  /tmp/dst_assets_cache/download_request.txt（用户选择的版本ID）
+//                   /tmp/dst_assets_cache/ready.flag       （用户确认应用）
+//                   /tmp/dst_assets_cache/skip_version.txt （用户跳过）
+
+#define DST_ASSET_HOST   "47.122.115.99"
+#define DST_ASSET_BASE   "/dst/"
+#define DST_API_BASE     "/api"
+#define DST_ASSET_CONN_TO  12
+#define DST_ASSET_BUDGET   300
+static const char* DST_TMP_CACHE = "/tmp/dst_assets_cache";
+
+// 用 orig_connect 直连（绕过 fishhook，不触发 SIGSEGV）
+static int dst_asset_http_get(const char* host, int port, const char* path, char* buf, int buflen) {
+    if (!orig_connect) return -1;
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    struct timeval tv; tv.tv_sec = DST_ASSET_CONN_TO; tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET; sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr(host);
+    if (orig_connect(sock, (const struct sockaddr*)&sa, sizeof(sa)) != 0) { close(sock); return -1; }
+    char req[512];
+    int rl = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: DSTIOS/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        path, host);
+    if (send(sock, req, (size_t)rl, 0) <= 0) { close(sock); return -1; }
+    int total = 0; int hdr_end = -1;
+    while (total < buflen - 1) {
+        int n = recv(sock, buf + total, buflen - total - 1, 0);
+        if (n <= 0) break;
+        total += n; buf[total] = 0;
+        // 找 \r\n\r\n
+        for (int i = 0; i <= total - 4; i++) {
+            if (buf[i]=='\r' && buf[i+1]=='\n' && buf[i+2]=='\r' && buf[i+3]=='\n') { hdr_end = i; break; }
+        }
+        if (hdr_end >= 0) break;
+    }
+    close(sock);
+    if (hdr_end < 0) return -1;
+    // 检查 HTTP 200
+    buf[hdr_end] = 0;
+    if (!strstr(buf, "200 OK") && !strstr(buf, "200 ")) return -1;
+    // 移动 body 到 buf 开头
+    int body_start = hdr_end + 4;
+    int body_len = total - body_start;
+    if (body_len > 0) memmove(buf, buf + body_start, body_len);
+    buf[body_len] = 0;
+    return body_len;
+}
+
+// 下载文件到指定路径（用 orig_connect，绕过 hook）
+static int dst_asset_download_file(const char* host, int port, const char* path, const char* out_path) {
+    if (!orig_connect) return -1;
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    struct timeval tv; tv.tv_sec = DST_ASSET_CONN_TO; tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET; sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr(host);
+    if (orig_connect(sock, (const struct sockaddr*)&sa, sizeof(sa)) != 0) { close(sock); return -1; }
+    char req[512];
+    int rl = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: DSTIOS/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        path, host);
+    if (send(sock, req, (size_t)rl, 0) <= 0) { close(sock); return -1; }
+    char buf[65536]; int total = 0; int hdr_end = -1;
+    while (total < (int)sizeof(buf)) {
+        int n = recv(sock, buf + total, sizeof(buf) - total, 0);
+        if (n <= 0) break;
+        total += n;
+        for (int i = 0; i <= total - 4; i++) {
+            if (buf[i]=='\r' && buf[i+1]=='\n' && buf[i+2]=='\r' && buf[i+3]=='\n') { hdr_end = i; break; }
+        }
+        if (hdr_end >= 0) break;
+    }
+    if (hdr_end < 0) { close(sock); return -1; }
+    buf[hdr_end] = 0;
+    if (!strstr(buf, "200 OK") && !strstr(buf, "200 ")) { close(sock); return -1; }
+    FILE* out = fopen(out_path, "wb");
+    if (!out) { close(sock); return -1; }
+    int body_start = hdr_end + 4;
+    if (body_start < total) fwrite(buf + body_start, 1, (size_t)(total - body_start), out);
+    time_t deadline = time(NULL) + DST_ASSET_BUDGET;
+    while (1) {
+        int n = recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        fwrite(buf, 1, (size_t)n, out);
+        if (time(NULL) > deadline) break;
+    }
+    fclose(out); close(sock);
+    return 0;
+}
+
+// 写文件到 /tmp/dst_assets_cache/
+static void dst_write_cache_file(const char* name, const char* content, int len) {
+    @autoreleasepool {
+        NSString* dir = [NSString stringWithUTF8String:DST_TMP_CACHE];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString* path = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+        FILE* f = fopen([path UTF8String], "wb");
+        if (f) { if (len > 0) fwrite(content, 1, (size_t)len, f); else fputs(content, f); fclose(f); }
+    }
+}
+
+// 读 /tmp/dst_assets_cache/ 文件
+static int dst_read_cache_file(const char* name, char* buf, int buflen) {
+    @autoreleasepool {
+        NSString* path = [[NSString stringWithUTF8String:DST_TMP_CACHE] stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+        FILE* f = fopen([path UTF8String], "r");
+        if (!f) return -1;
+        int n = (int)fread(buf, 1, (size_t)buflen - 1, f);
+        buf[n] = 0; fclose(f);
+        // trim
+        while (n > 0 && (buf[n-1]=='\n' || buf[n-1]=='\r' || buf[n-1]==' ')) buf[--n] = 0;
+        return n;
+    }
+}
+
+static int dst_cache_file_exists(const char* name) {
+    @autoreleasepool {
+        NSString* path = [[NSString stringWithUTF8String:DST_TMP_CACHE] stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+        return [[NSFileManager defaultManager] fileExistsAtPath:path] ? 1 : 0;
+    }
+}
+
+static void dst_remove_cache_file(const char* name) {
+    @autoreleasepool {
+        NSString* path = [[NSString stringWithUTF8String:DST_TMP_CACHE] stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    }
+}
+
+// 后台 worker：拉版本列表 + 轮询下载请求 + 下载
+static void* dst_asset_worker(void* arg) {
+    (void)arg;
+    @try {
+        LOGD("=== dst asset worker v12 start (background) ===");
+
+        // 1) 拉版本列表 -> versions.json
+        char vbuf[65536];
+        char api_path[256];
+        snprintf(api_path, sizeof(api_path), "%s/versions", DST_API_BASE);
+        int vlen = dst_asset_http_get(DST_ASSET_HOST, 3000, api_path, vbuf, sizeof(vbuf));
+        if (vlen <= 0) {
+            // 试 80 端口
+            vlen = dst_asset_http_get(DST_ASSET_HOST, 80, api_path, vbuf, sizeof(vbuf));
+        }
+        if (vlen > 0) {
+            dst_write_cache_file("versions.json", vbuf, vlen);
+            LOGD("asset worker: versions.json written (%d bytes)", vlen);
+        } else {
+            LOGE("asset worker: failed to fetch versions.json");
+        }
+
+        // 2) 轮询 download_request.txt
+        int poll_count = 0;
+        while (1) {
+            sleep(3);
+            poll_count++;
+
+            // 检查是否有下载请求
+            char req_ver[256];
+            int rlen = dst_read_cache_file("download_request.txt", req_ver, sizeof(req_ver));
+            if (rlen > 0 && req_ver[0] != 0) {
+                LOGD("asset worker: download request for version '%s'", req_ver);
+
+                // 检查是否已在下载（简单防重：删请求文件）
+                dst_remove_cache_file("download_request.txt");
+
+                // 下载该版本的 scripts.zip + images.zip + version.txt
+                const char* assets[] = {"scripts.zip", "images.zip", "version.txt"};
+                int all_ok = 1;
+                for (int i = 0; i < 3; i++) {
+                    char dl_path[512];
+                    snprintf(dl_path, sizeof(dl_path), "%s/version/%s/%s",
+                             DST_API_BASE, req_ver, assets[i]);
+
+                    // 写进度
+                    char prog[128];
+                    snprintf(prog, sizeof(prog), "%s 0 0\n", assets[i]);
+                    dst_write_cache_file("progress.txt", prog, 0);
+
+                    @autoreleasepool {
+                        NSString* dir = [NSString stringWithUTF8String:DST_TMP_CACHE];
+                        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                    }
+
+                    char out_path[512];
+                    snprintf(out_path, sizeof(out_path), "%s/%s", DST_TMP_CACHE, assets[i]);
+
+                    int port = 3000;
+                    int rc = dst_asset_download_file(DST_ASSET_HOST, port, dl_path, out_path);
+                    if (rc != 0) {
+                        // 试 80
+                        rc = dst_asset_download_file(DST_ASSET_HOST, 80, dl_path, out_path);
+                    }
+                    if (rc != 0) {
+                        LOGE("asset worker: download %s failed", assets[i]);
+                        all_ok = 0; break;
+                    }
+                    // 写进度
+                    @autoreleasepool {
+                        NSString* fp = [NSString stringWithUTF8String:out_path];
+                        NSDictionary* att = [[NSFileManager defaultManager] attributesOfItemAtPath:fp error:nil];
+                        long long sz = att ? [att fileSize] : 0;
+                        char prog2[128];
+                        snprintf(prog2, sizeof(prog2), "%s %lld %lld\n", assets[i], sz, sz);
+                        dst_write_cache_file("progress.txt", prog2, 0);
+                    }
+                    LOGD("asset worker: %s downloaded OK", assets[i]);
+                }
+
+                dst_remove_cache_file("progress.txt");
+
+                if (all_ok) {
+                    // 读 version.txt 获取版本号
+                    char ver_str[128]; ver_str[0] = 0;
+                    char ver_path[512];
+                    snprintf(ver_path, sizeof(ver_path), "%s/version.txt", DST_TMP_CACHE);
+                    FILE* vf = fopen(ver_path, "r");
+                    if (vf) { fgets(ver_str, sizeof(ver_str), vf); fclose(vf);
+                        size_t L = strlen(ver_str);
+                        while (L > 0 && (ver_str[L-1]=='\n'||ver_str[L-1]=='\r')) ver_str[--L]=0;
+                    }
+                    if (ver_str[0] == 0) strncpy(ver_str, req_ver, sizeof(ver_str)-1);
+
+                    // 写 pending_version.txt
+                    char pv[256];
+                    snprintf(pv, sizeof(pv), "%s\n", ver_str);
+                    dst_write_cache_file("pending_version.txt", pv, 0);
+                    LOGD("asset worker: download complete -> pending_version=%s", ver_str);
+                } else {
+                    char err_msg[256];
+                    snprintf(err_msg, sizeof(err_msg), "error: download %s failed\n", req_ver);
+                    dst_write_cache_file("pending_version.txt", err_msg, 0);
+                }
+            }
+
+            // 每 30 轮重新拉一次版本列表
+            if (poll_count % 10 == 0) {
+                vlen = dst_asset_http_get(DST_ASSET_HOST, 3000, api_path, vbuf, sizeof(vbuf));
+                if (vlen <= 0) vlen = dst_asset_http_get(DST_ASSET_HOST, 80, api_path, vbuf, sizeof(vbuf));
+                if (vlen > 0) dst_write_cache_file("versions.json", vbuf, vlen);
+            }
+        }
+    } @catch (NSException* e) {
+        LOGE("asset worker exception: %s", [[e description] UTF8String]);
+    }
+    return NULL;
+}
+
+__attribute__((constructor(99)))
+static void dst_asset_worker_init() {
+    dst_ensure_log();
+    LOGD("=== dst_asset_worker_init: spawn background worker ===");
+    pthread_t t;
+    if (pthread_create(&t, NULL, dst_asset_worker, NULL) == 0) {
+        pthread_detach(t);
+    } else {
+        LOGE("asset worker: pthread_create failed");
+    }
+}
+
 // ============ 皮肤解锁注入 (IOSVISION v6.1) - 必须保留 ============
 static NSString* extract_field_from_file(NSString* path, NSString* field) {
     if(!path||![[NSFileManager defaultManager] fileExistsAtPath:path]) return nil;
