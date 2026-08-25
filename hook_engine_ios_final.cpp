@@ -244,6 +244,7 @@ static int dst_assets_ready(void) {
 // 重定向 ../Documents/ 相对路径到沙箱 Documents 绝对路径
 // Lua 的 io.open 底层调用 fopen，CWD = bundle data/（只读），
 // ../Documents/ 解析到 bundle 内（只读），需要重定向到沙箱 Documents
+// v17: 对写模式也重定向，且不再要求文件已存在（写模式创建新文件时也要重定向）
 static char g_lua_redirect_buf[1024];
 static const char* dst_redirect_lua_path(const char* path) {
     if(!path) return path;
@@ -252,11 +253,14 @@ static const char* dst_redirect_lua_path(const char* path) {
     @autoreleasepool {
         NSString* rel = [NSString stringWithUTF8String:path+13]; // 跳过 ../Documents/
         NSString* abs = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:rel];
-        if([[NSFileManager defaultManager] fileExistsAtPath:abs]) {
-            strncpy(g_lua_redirect_buf, [abs UTF8String], 1023);
-            g_lua_redirect_buf[1023] = 0;
-            return g_lua_redirect_buf;
-        }
+        // 确保父目录存在（写模式创建文件时父目录可能不存在）
+        NSString* parentDir = [abs stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+        // v17: 不再检查文件是否存在，直接返回绝对路径
+        // 这样写模式也能正确重定向到沙箱目录
+        strncpy(g_lua_redirect_buf, [abs UTF8String], 1023);
+        g_lua_redirect_buf[1023] = 0;
+        return g_lua_redirect_buf;
     }
     return path;
 }
@@ -312,9 +316,17 @@ static int fake_renameat(int oldfd,const char* oldp,int newfd,const char* newp) 
 // ---- C-stdio ----
 static FILE* g_tok_wfile=NULL;
 static FILE* fake_fopen(const char* path,const char* mode) {
-    if(!g_open_reent && mode && mode[0]=='r' && !strchr(mode,'+')) {
-        const char* red=dst_redirect_databundle(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
-        red=dst_redirect_lua_path(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+    // v17: 对读模式和写模式都做 ../Documents/ 路径重定向
+    if(!g_open_reent && mode) {
+        // 读模式：先检查 databundle 重定向，再检查 lua_path 重定向
+        if(mode[0]=='r' && !strchr(mode,'+')) {
+            const char* red=dst_redirect_databundle(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+            red=dst_redirect_lua_path(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+        }
+        // 写模式：只做 lua_path 重定向（databundle 不需要写重定向）
+        if(strchr(mode,'w')||strchr(mode,'a')||strchr(mode,'+')) {
+            const char* red=dst_redirect_lua_path(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+        }
     }
     FILE* f=orig_fopen?orig_fopen(path,mode):fopen(path,mode);
     if(f&&!g_open_reent&&path&&path_is_cluster_token(path)&&mode&&(strchr(mode,'w')||strchr(mode,'a')||strchr(mode,'+'))) { g_tok_wfile=f; strncpy(g_tok_wpath,path,511); g_tok_wpath[511]=0; }
