@@ -411,6 +411,7 @@ static int dst_asset_http_get(const char* host, int port, const char* path, char
         path, host);
     if (send(sock, req, (size_t)rl, 0) <= 0) { close(sock); return -1; }
     int total = 0; int hdr_end = -1;
+    // 阶段1：接收直到找到 HTTP 头结束
     while (total < buflen - 1) {
         int n = recv(sock, buf + total, buflen - total - 1, 0);
         if (n <= 0) break;
@@ -421,13 +422,19 @@ static int dst_asset_http_get(const char* host, int port, const char* path, char
         }
         if (hdr_end >= 0) break;
     }
+    if (hdr_end < 0) { close(sock); return -1; }
+    // 阶段2：继续接收 body（Connection: close 模式下 body 可能分多次到达）
+    int body_start = hdr_end + 4;
+    while (total < buflen - 1) {
+        int n = recv(sock, buf + total, buflen - total - 1, 0);
+        if (n <= 0) break;
+        total += n; buf[total] = 0;
+    }
     close(sock);
-    if (hdr_end < 0) return -1;
     // 检查 HTTP 200
     buf[hdr_end] = 0;
     if (!strstr(buf, "200 OK") && !strstr(buf, "200 ")) return -1;
     // 移动 body 到 buf 开头
-    int body_start = hdr_end + 4;
     int body_len = total - body_start;
     if (body_len > 0) memmove(buf, buf + body_start, body_len);
     buf[body_len] = 0;
