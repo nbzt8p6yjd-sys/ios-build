@@ -17,12 +17,13 @@ jobs:
 
       - name: Compile libMODASSET.dylib (mod asset redirect)
         run: |
+          mv modasset_hook.cpp modasset_hook.mm
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           clang++ -arch arm64 -target arm64-apple-ios12.0 -isysroot "$SDK" \
             -dynamiclib -fobjc-arc -std=c++17 -I. \
             -framework Foundation -lz \
             -install_name @rpath/libMODASSET.dylib \
-            modasset_hook.cpp fishhook.c \
+            modasset_hook.mm fishhook.c \
             -o libMODASSET.dylib
 
       - name: Ad-hoc codesign
