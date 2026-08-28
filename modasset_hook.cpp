@@ -59,7 +59,7 @@ static void ma_log(const char *fmt, ...) {
 }
 
 // ---------------- zip 索引 ----------------
-typedef struct { char *name; uint64_t lho; uint32_t csize; uint32_t usize; uint16_t method; } ma_ent;
+typedef struct { char *name; char *shortname; uint64_t lho; uint32_t csize; uint32_t usize; uint16_t method; } ma_ent;
 static ma_ent *g_ents = NULL;
 static int g_n = 0, g_cap = 0, g_ready = 0;   // g_ready: 0未试 1就绪 -1失败
 static FILE *g_zf = NULL;
@@ -72,6 +72,12 @@ static void ma_add(const char *n, uint64_t lho, uint32_t cs, uint32_t us, uint16
     }
     ma_ent *e = &g_ents[g_n++];
     e->name = strdup(n); e->lho = lho; e->csize = cs; e->usize = us; e->method = m;
+    // 短路径：zip 内条目从 "levels/" 开始的后缀。
+    // Lua 侧 resolvefilepath 常返回这种不带 scripts/mods/ 前缀的短路径
+    // （v6 真机日志实证：atlas=levels/tiles/cave.xml、noise=levels/textures/ocean_noise.tex），
+    // 而 _fw_asset_case_aliases.lua 的 key 也正是这种短路径。
+    const char *sp = strstr(n, "levels/");
+    e->shortname = (sp && sp > n) ? strdup(sp) : NULL;
 }
 
 static int ma_eocd(FILE *f, uint64_t *cd_off, uint32_t *cd_size, uint32_t *nent) {
@@ -136,6 +142,10 @@ static int ma_index() {
 
 static ma_ent *ma_find(const char *name) {
     for (int i = 0; i < g_n; i++) if (strcmp(g_ents[i].name, name) == 0) return &g_ents[i];
+    for (int i = 0; i < g_n; i++) {
+        char *sn = g_ents[i].shortname;
+        if (sn && strcmp(sn, name) == 0) return &g_ents[i];
+    }
     return NULL;
 }
 
@@ -201,14 +211,20 @@ static int ma_extract(ma_ent *e, const char *dst) {
 
 // 重定向：命中 scripts/mods/ 且物理不存在 -> 从 zip 解出
 static char g_buf[2048];
+static int g_hits = 0, g_miss = 0;   // 日志限流：v11 曾因逐条打印刷出 140MB
 static const char *ma_redirect(const char *path) {
     if (!path || !*path) return path;
+    // 只关心两类：完整模组路径 scripts/mods/...，或资源短路径 .../levels/...
     const char *hit = strstr(path, "scripts/mods/");
+    if (!hit) hit = strstr(path, "levels/");
     if (!hit) return path;
     if (access(path, F_OK) == 0) return path;          // 物理存在，不干预
     if (ma_index() != 0) return path;
     ma_ent *e = ma_find(hit);
-    if (!e) { ma_log("[MODASSET] not in zip: %s", hit); return path; }
+    if (!e) {
+        if (g_miss < 30) { ma_log("[MODASSET] not in zip: %s", hit); g_miss++; }
+        return path;
+    }
     @autoreleasepool {
         NSString *c = [ma_cache_dir() stringByAppendingPathComponent:[NSString stringWithUTF8String:hit]];
         if (![[NSFileManager defaultManager] fileExistsAtPath:c]) {
@@ -220,7 +236,9 @@ static const char *ma_redirect(const char *path) {
         strncpy(g_buf, [c fileSystemRepresentation], 2047);
     }
     g_buf[2047] = 0;
-    ma_log("[MODASSET] redirect %s -> %s", hit, g_buf);
+    g_hits++;
+    if (g_hits <= 60) ma_log("[MODASSET] redirect %s -> %s", hit, g_buf);
+    else if (g_hits == 61) ma_log("[MODASSET] (further redirects suppressed, total so far %d)", g_hits);
     return g_buf;
 }
 
