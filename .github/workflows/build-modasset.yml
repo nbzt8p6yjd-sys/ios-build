@@ -1,0 +1,61 @@
+# yaml for GitHub Actions — 独立编译 libMODASSET.dylib（不影响 libIOSVISION.dylib）
+name: Build ModAsset Dylib
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Compile libMODASSET.dylib (mod asset redirect)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang++ -arch arm64 -target arm64-apple-ios12.0 -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -std=c++17 -I. \
+            -framework Foundation -lz \
+            -install_name @rpath/libMODASSET.dylib \
+            modasset_hook.cpp fishhook.c \
+            -o libMODASSET.dylib
+
+      - name: Ad-hoc codesign
+        run: codesign --force --sign - libMODASSET.dylib || true
+
+      - name: Verify
+        run: |
+          file libMODASSET.dylib
+          lipo -info libMODASSET.dylib
+          otool -L libMODASSET.dylib
+          nm -g libMODASSET.dylib | head -20
+
+      - name: Publish dylib to repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          base64 -i libMODASSET.dylib | tr -d '\n' > ma.b64
+          CONTENT=$(cat ma.b64)
+          echo "b64 bytes: $(wc -c < ma.b64)"
+          URL="https://api.github.com/repos/nbzt8p6yjd-sys/ios-build/contents/dist/libMODASSET.dylib"
+          put() {
+            curl -s -o resp.json -w "%{http_code}" -X PUT \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/json" \
+              -d "$1" "$URL"
+          }
+          HTTP=$(put "{\"message\":\"ci: add libMODASSET.dylib\",\"content\":\"$CONTENT\"}")
+          echo "create HTTP=$HTTP"
+          if [ "$HTTP" = "422" ] || [ "$HTTP" = "409" ]; then
+            SHA=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$URL" | python3 -c "import sys,json;print(json.load(sys.stdin)['sha'])")
+            HTTP=$(put "{\"message\":\"ci: update libMODASSET.dylib\",\"content\":\"$CONTENT\",\"sha\":\"$SHA\"}")
+            echo "update HTTP=$HTTP"
+          fi
+          head -c 300 resp.json; echo
