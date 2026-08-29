@@ -145,11 +145,13 @@ typedef int (*x509_verify_cert_fn)(void*);
 static x509_verify_cert_fn orig_X509_verify_cert=NULL;
 static int fake_X509_verify_cert(void* ctx) { (void)ctx; return 1; }
 
-// ============ v22 texture memory hook (Metal mipmap strip + GLES mipmap disable) ============
-// Goal: cut GPU-resident texture memory to relieve iOS per-process-limit jetsam (2.46GB OOM).
-// Only strips mipmaps (force mipmapLevelCount=1). Mip levels are optional refinement; engine
-// handles levelCount=1 universally -> zero render risk. Texture dimensions are NOT changed, so
-// no upload-size mismatch / corruption.
+// ============ v23 texture memory DIAGNOSTIC (measure, don't guess) ============
+// v22 proved (dst_hook.log: ZERO "stripped" hits) DST creates Metal textures with mipmapLevelCount
+// already = 1, so mipmap stripping saves NOTHING. v23 MEASURES the real GPU texture footprint by
+// swizzling -[MTLDevice newTextureWithDescriptor:] (fires for EVERY Metal texture) and classifies
+// uncompressed vs compressed (ASTC/PVRTC) formats. This tells us whether texture downscaling is even
+// viable (compressed formats CANNOT be downscaled from a dylib without decompress/recompress).
+// mipmapLevelCount=1 is still forced as a harmless safe no-op.
 #ifndef GL_TEXTURE_MIN_FILTER
 #define GL_TEXTURE_MIN_FILTER 0x2801
 #define GL_NEAREST 0x2600
@@ -160,14 +162,41 @@ static int fake_X509_verify_cert(void* ctx) { (void)ctx; return 1; }
 #define GL_LINEAR_MIPMAP_LINEAR 0x2703
 #endif
 
-static volatile long g_mip_stripped = 0;
+// v23 MEASUREMENT state: accumulate real GPU texture footprint via newTextureWithDescriptor:
+static volatile long long g_tex_bytes = 0;
+static volatile long g_tex_count = 0;
+static volatile long g_tex_uncomp = 0;
+static volatile long g_tex_comp = 0;
+static volatile int  g_dev_swizzled = 0;
+
+// approximate bytes for ONE mip level (w*h*bpp); compressed formats counted separately.
+static unsigned long mtl_bytes_estimate(unsigned long w, unsigned long h, unsigned long pf) {
+    if (w==0||h==0) return 0;
+    if (pf>=10 && pf<=14) return w*h*1;        // R8
+    if (pf>=20 && pf<=24) return w*h*2;        // RG8
+    if (pf>=70 && pf<=74) return w*h*4;        // RGBA8
+    if (pf==80||pf==81)   return w*h*4;        // BGRA8
+    if (pf==90||pf==91)   return w*h*4;        // RGB10A2
+    if (pf==77)           return w*h*8;        // RGBA16Unorm
+    if (pf==78)           return w*h*8;        // RGBA16Float
+    if (pf==82)           return w*h*16;       // RGBA32Float
+    if (pf==83||pf==84)   return w*h*4;        // RG16
+    if (pf==85||pf==86)   return w*h*8;        // RGBA16(snorm)
+    if (pf==163||pf==165) return w*h/4;        // PVRTC 2bpp
+    if (pf==164||pf==166) return w*h/2;        // PVRTC 4bpp
+    if ((pf>=170 && pf<=187) || (pf>=190 && pf<=207)) return w*h; // ASTC ~1 byte/texel
+    return w*h*4; // unknown -> assume RGBA8 (conservative)
+}
+static int mtl_is_compressed(unsigned long pf) {
+    if (pf>=163 && pf<=166) return 1; // PVRTC
+    if ((pf>=170 && pf<=187) || (pf>=190 && pf<=207)) return 1; // ASTC
+    return 0;
+}
 
 static void (*orig_glGenerateMipmap)(unsigned int target) = NULL;
 static void dst_fake_glGenerateMipmap(unsigned int target) {
-    // Disable mipmap generation: GPU no longer allocates mip levels (~33% of texture bytes saved).
     (void)target;
-    long c = __sync_fetch_and_add(&g_mip_stripped, 1);
-    if ((c & 0xFFF) == 0) LOGD("texmem: GLES mipmap gen disabled, total=%ld", c);
+    LOGD("texmem: GLES glGenerateMipmap hit (unexpected if Metal backend)");
 }
 static void (*orig_glTexParameteri)(unsigned int target, unsigned int pname, int param) = NULL;
 static void dst_fake_glTexParameteri(unsigned int target, unsigned int pname, int param) {
@@ -182,50 +211,77 @@ static void dst_fake_glTexParameteri(unsigned int target, unsigned int pname, in
     if (orig_glTexParameteri) orig_glTexParameteri(target, pname, param);
 }
 
-// ---- Metal: strip MTLTextureDescriptor mipmap ----
+// ---- Metal: safe mipmapLevelCount=1 force (belt & suspenders; proven no-op but harmless) ----
 static void (*orig_MTLTD_setMipmapLevelCount)(id, SEL, unsigned long) = NULL;
 static void dst_swiz_MTLTD_setMipmapLevelCount(id self, SEL _cmd, unsigned long lvl) {
-    if (lvl > 1) { lvl = 1; long c = __sync_fetch_and_add(&g_mip_stripped, 1);
-        if ((c & 0xFFF) == 0) LOGD("texmem: Metal mipmap stripped, total=%ld", c); }
+    if (lvl > 1) lvl = 1;
     if (orig_MTLTD_setMipmapLevelCount) orig_MTLTD_setMipmapLevelCount(self, _cmd, lvl);
 }
-static id (*orig_MTLTD_t2d)(id, SEL, unsigned long, unsigned long, unsigned long, BOOL) = NULL;
-static id dst_swiz_MTLTD_t2d(id cls, SEL _cmd, unsigned long pf, unsigned long w, unsigned long h, BOOL mip) {
-    (void)mip; __sync_fetch_and_add(&g_mip_stripped, 1);
-    if (orig_MTLTD_t2d) return orig_MTLTD_t2d(cls, _cmd, pf, w, h, NO);
-    return nil;
+
+// ---- core MEASUREMENT: swizzle -[MTLDevice newTextureWithDescriptor:] (fires for EVERY texture) ----
+static id (*orig_newTextureWithDescriptor)(id, SEL, id) = NULL;
+static id dst_swiz_newTextureWithDescriptor(id self, SEL _cmd, id desc) {
+    if (desc) {
+        typedef unsigned long (*mu)(id,SEL);
+        typedef void (*ms)(id,SEL,unsigned long);
+        unsigned long w  = ((mu)objc_msgSend)(desc, @selector(width));
+        unsigned long h  = ((mu)objc_msgSend)(desc, @selector(height));
+        unsigned long pf = ((mu)objc_msgSend)(desc, @selector(pixelFormat));
+        unsigned long lv = ((mu)objc_msgSend)(desc, @selector(mipmapLevelCount));
+        if (lv > 1) { // safe: engine handles levelCount=1 universally
+            ((ms)objc_msgSend)(desc, @selector(setMipmapLevelCount:), (unsigned long)1);
+        }
+        unsigned long long b = (unsigned long long)mtl_bytes_estimate(w,h,pf);
+        __sync_fetch_and_add(&g_tex_bytes, (long long)b);
+        long c = __sync_fetch_and_add(&g_tex_count, 1);
+        if (mtl_is_compressed(pf)) __sync_fetch_and_add(&g_tex_comp, 1);
+        else __sync_fetch_and_add(&g_tex_uncomp, 1);
+        if ((c & 0x3FF) == 0) {
+            double mb = (double)g_tex_bytes / 1e6;
+            LOGD("texmem: measured textures=%ld GPU~%.1fMB (uncomp=%ld comp=%ld)", c, mb, (long)g_tex_uncomp, (long)g_tex_comp);
+        }
+    }
+    return orig_newTextureWithDescriptor(self, _cmd, desc);
 }
-static id (*orig_MTLTD_tcube)(id, SEL, unsigned long, unsigned long, BOOL) = NULL;
-static id dst_swiz_MTLTD_tcube(id cls, SEL _cmd, unsigned long pf, unsigned long s, BOOL mip) {
-    (void)mip; __sync_fetch_and_add(&g_mip_stripped, 1);
-    if (orig_MTLTD_tcube) return orig_MTLTD_tcube(cls, _cmd, pf, s, NO);
-    return nil;
+static id (*orig_MTLCreateSystemDefaultDevice)(void) = NULL;
+static id dst_fake_MTLCreateSystemDefaultDevice(void) {
+    id dev = orig_MTLCreateSystemDefaultDevice ? orig_MTLCreateSystemDefaultDevice() : nil;
+    if (dev && !g_dev_swizzled) {
+        Class dc = object_getClass(dev);
+        SEL s = @selector(newTextureWithDescriptor:);
+        Method m = class_getInstanceMethod(dc, s);
+        if (m) {
+            orig_newTextureWithDescriptor = (id(*)(id,SEL,id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)dst_swiz_newTextureWithDescriptor);
+            g_dev_swizzled = 1;
+            LOGD("texmem: MTLDevice newTextureWithDescriptor: swizzled (MEASUREMENT ON)");
+        } else {
+            LOGD("texmem: newTextureWithDescriptor: NOT found on device class");
+        }
+    }
+    return dev;
 }
 static void dst_install_metal_mipmap_hook(void) {
     // Ensure Metal framework is loaded (in case engine uses the Metal backend); harmless if GLES.
     dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY);
     Class cls = objc_getClass("MTLTextureDescriptor");
-    if (!cls) { LOGD("texmem: MTLTextureDescriptor not found (GLES backend?)"); return; }
-    @try {
-        SEL sm = @selector(setMipmapLevelCount:);
-        Method m = class_getInstanceMethod(cls, sm);
-        if (m) { orig_MTLTD_setMipmapLevelCount = (void(*)(id,SEL,unsigned long))method_getImplementation(m);
-                 method_setImplementation(m, (IMP)dst_swiz_MTLTD_setMipmapLevelCount); }
-        SEL s2 = @selector(texture2DDescriptorWithPixelFormat:width:height:mipmapped:);
-        Method m2 = class_getClassMethod(cls, s2);
-        if (m2) { orig_MTLTD_t2d = (id(*)(id,SEL,unsigned long,unsigned long,unsigned long,BOOL))method_getImplementation(m2);
-                  method_setImplementation(m2, (IMP)dst_swiz_MTLTD_t2d); }
-        SEL s3 = @selector(textureCubeDescriptorWithPixelFormat:size:mipmapped:);
-        Method m3 = class_getClassMethod(cls, s3);
-        if (m3) { orig_MTLTD_tcube = (id(*)(id,SEL,unsigned long,unsigned long,BOOL))method_getImplementation(m3);
-                  method_setImplementation(m3, (IMP)dst_swiz_MTLTD_tcube); }
-        LOGD("texmem: Metal mipmap hook installed");
-    } @catch (NSException* e) { LOGE("texmem metal swizzle: %s", [[e description] UTF8String]); }
+    if (cls) {
+        @try {
+            SEL sm = @selector(setMipmapLevelCount:);
+            Method m = class_getInstanceMethod(cls, sm);
+            if (m) {
+                orig_MTLTD_setMipmapLevelCount = (void(*)(id,SEL,unsigned long))method_getImplementation(m);
+                method_setImplementation(m, (IMP)dst_swiz_MTLTD_setMipmapLevelCount);
+            }
+        } @catch (NSException* e) { LOGE("texmem desc swizzle: %s", [[e description] UTF8String]); }
+    } else {
+        LOGD("texmem: MTLTextureDescriptor class not found");
+    }
 }
 __attribute__((constructor(50)))
 static void dst_texture_mem_ctor(void) {
     dst_ensure_log();
-    LOGD("=== DST texture memory hook v22 init ===");
+    LOGD("=== DST texture memory hook v23 init (MEASUREMENT) ===");
     dst_install_metal_mipmap_hook();
 }
 
@@ -262,6 +318,7 @@ static void dst_resolve_and_interpose() {
         {"renameat",(void*)fake_renameat,(void**)&orig_renameat},
         {"glGenerateMipmap",(void*)dst_fake_glGenerateMipmap,(void**)&orig_glGenerateMipmap},
         {"glTexParameteri",(void*)dst_fake_glTexParameteri,(void**)&orig_glTexParameteri},
+        {"MTLCreateSystemDefaultDevice",(void*)dst_fake_MTLCreateSystemDefaultDevice,(void**)&orig_MTLCreateSystemDefaultDevice},
     };
     rebind_symbols(rebinds,sizeof(rebinds)/sizeof(rebinds[0]));
     LOGD("fishhook rebind done");
