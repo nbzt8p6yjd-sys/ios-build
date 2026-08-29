@@ -21,6 +21,7 @@
 #include <strings.h>
 #include <Foundation/Foundation.h>
 #include <objc/runtime.h>
+#include <objc/message.h>
 #include <UIKit/UIKit.h>
 #include <Security/Security.h>
 #include <mach-o/dyld.h>
