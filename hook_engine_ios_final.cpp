@@ -21,7 +21,6 @@
 #include <strings.h>
 #include <Foundation/Foundation.h>
 #include <objc/runtime.h>
-#include <objc/message.h>
 #include <UIKit/UIKit.h>
 #include <Security/Security.h>
 #include <mach-o/dyld.h>
@@ -146,146 +145,6 @@ typedef int (*x509_verify_cert_fn)(void*);
 static x509_verify_cert_fn orig_X509_verify_cert=NULL;
 static int fake_X509_verify_cert(void* ctx) { (void)ctx; return 1; }
 
-// ============ v23 texture memory DIAGNOSTIC (measure, don't guess) ============
-// v22 proved (dst_hook.log: ZERO "stripped" hits) DST creates Metal textures with mipmapLevelCount
-// already = 1, so mipmap stripping saves NOTHING. v23 MEASURES the real GPU texture footprint by
-// swizzling -[MTLDevice newTextureWithDescriptor:] (fires for EVERY Metal texture) and classifies
-// uncompressed vs compressed (ASTC/PVRTC) formats. This tells us whether texture downscaling is even
-// viable (compressed formats CANNOT be downscaled from a dylib without decompress/recompress).
-// mipmapLevelCount=1 is still forced as a harmless safe no-op.
-#ifndef GL_TEXTURE_MIN_FILTER
-#define GL_TEXTURE_MIN_FILTER 0x2801
-#define GL_NEAREST 0x2600
-#define GL_LINEAR 0x2601
-#define GL_NEAREST_MIPMAP_NEAREST 0x2700
-#define GL_LINEAR_MIPMAP_NEAREST 0x2701
-#define GL_NEAREST_MIPMAP_LINEAR 0x2702
-#define GL_LINEAR_MIPMAP_LINEAR 0x2703
-#endif
-
-// v23 MEASUREMENT state: accumulate real GPU texture footprint via newTextureWithDescriptor:
-static volatile long long g_tex_bytes = 0;
-static volatile long g_tex_count = 0;
-static volatile long g_tex_uncomp = 0;
-static volatile long g_tex_comp = 0;
-static volatile int  g_dev_swizzled = 0;
-
-// approximate bytes for ONE mip level (w*h*bpp); compressed formats counted separately.
-static unsigned long mtl_bytes_estimate(unsigned long w, unsigned long h, unsigned long pf) {
-    if (w==0||h==0) return 0;
-    if (pf>=10 && pf<=14) return w*h*1;        // R8
-    if (pf>=20 && pf<=24) return w*h*2;        // RG8
-    if (pf>=70 && pf<=74) return w*h*4;        // RGBA8
-    if (pf==80||pf==81)   return w*h*4;        // BGRA8
-    if (pf==90||pf==91)   return w*h*4;        // RGB10A2
-    if (pf==77)           return w*h*8;        // RGBA16Unorm
-    if (pf==78)           return w*h*8;        // RGBA16Float
-    if (pf==82)           return w*h*16;       // RGBA32Float
-    if (pf==83||pf==84)   return w*h*4;        // RG16
-    if (pf==85||pf==86)   return w*h*8;        // RGBA16(snorm)
-    if (pf==163||pf==165) return w*h/4;        // PVRTC 2bpp
-    if (pf==164||pf==166) return w*h/2;        // PVRTC 4bpp
-    if ((pf>=170 && pf<=187) || (pf>=190 && pf<=207)) return w*h; // ASTC ~1 byte/texel
-    return w*h*4; // unknown -> assume RGBA8 (conservative)
-}
-static int mtl_is_compressed(unsigned long pf) {
-    if (pf>=163 && pf<=166) return 1; // PVRTC
-    if ((pf>=170 && pf<=187) || (pf>=190 && pf<=207)) return 1; // ASTC
-    return 0;
-}
-
-static void (*orig_glGenerateMipmap)(unsigned int target) = NULL;
-static void dst_fake_glGenerateMipmap(unsigned int target) {
-    (void)target;
-    LOGD("texmem: GLES glGenerateMipmap hit (unexpected if Metal backend)");
-}
-static void (*orig_glTexParameteri)(unsigned int target, unsigned int pname, int param) = NULL;
-static void dst_fake_glTexParameteri(unsigned int target, unsigned int pname, int param) {
-    // If mipmap sampling requested but mipmaps are disabled, downgrade to LINEAR to avoid sampling
-    // nonexistent mip levels.
-    if (pname == GL_TEXTURE_MIN_FILTER) {
-        if (param == GL_NEAREST_MIPMAP_NEAREST || param == GL_LINEAR_MIPMAP_NEAREST ||
-            param == GL_NEAREST_MIPMAP_LINEAR || param == GL_LINEAR_MIPMAP_LINEAR) {
-            param = GL_LINEAR;
-        }
-    }
-    if (orig_glTexParameteri) orig_glTexParameteri(target, pname, param);
-}
-
-// ---- Metal: safe mipmapLevelCount=1 force (belt & suspenders; proven no-op but harmless) ----
-static void (*orig_MTLTD_setMipmapLevelCount)(id, SEL, unsigned long) = NULL;
-static void dst_swiz_MTLTD_setMipmapLevelCount(id self, SEL _cmd, unsigned long lvl) {
-    if (lvl > 1) lvl = 1;
-    if (orig_MTLTD_setMipmapLevelCount) orig_MTLTD_setMipmapLevelCount(self, _cmd, lvl);
-}
-
-// ---- core MEASUREMENT: swizzle -[MTLDevice newTextureWithDescriptor:] (fires for EVERY texture) ----
-static id (*orig_newTextureWithDescriptor)(id, SEL, id) = NULL;
-static id dst_swiz_newTextureWithDescriptor(id self, SEL _cmd, id desc) {
-    if (desc) {
-        typedef unsigned long (*mu)(id,SEL);
-        typedef void (*ms)(id,SEL,unsigned long);
-        unsigned long w  = ((mu)objc_msgSend)(desc, @selector(width));
-        unsigned long h  = ((mu)objc_msgSend)(desc, @selector(height));
-        unsigned long pf = ((mu)objc_msgSend)(desc, @selector(pixelFormat));
-        unsigned long lv = ((mu)objc_msgSend)(desc, @selector(mipmapLevelCount));
-        if (lv > 1) { // safe: engine handles levelCount=1 universally
-            ((ms)objc_msgSend)(desc, @selector(setMipmapLevelCount:), (unsigned long)1);
-        }
-        unsigned long long b = (unsigned long long)mtl_bytes_estimate(w,h,pf);
-        __sync_fetch_and_add(&g_tex_bytes, (long long)b);
-        long c = __sync_fetch_and_add(&g_tex_count, 1);
-        if (mtl_is_compressed(pf)) __sync_fetch_and_add(&g_tex_comp, 1);
-        else __sync_fetch_and_add(&g_tex_uncomp, 1);
-        if ((c & 0x3FF) == 0) {
-            double mb = (double)g_tex_bytes / 1e6;
-            LOGD("texmem: measured textures=%ld GPU~%.1fMB (uncomp=%ld comp=%ld)", c, mb, (long)g_tex_uncomp, (long)g_tex_comp);
-        }
-    }
-    return orig_newTextureWithDescriptor(self, _cmd, desc);
-}
-static id (*orig_MTLCreateSystemDefaultDevice)(void) = NULL;
-static id dst_fake_MTLCreateSystemDefaultDevice(void) {
-    id dev = orig_MTLCreateSystemDefaultDevice ? orig_MTLCreateSystemDefaultDevice() : nil;
-    if (dev && !g_dev_swizzled) {
-        Class dc = object_getClass(dev);
-        SEL s = @selector(newTextureWithDescriptor:);
-        Method m = class_getInstanceMethod(dc, s);
-        if (m) {
-            orig_newTextureWithDescriptor = (id(*)(id,SEL,id))method_getImplementation(m);
-            method_setImplementation(m, (IMP)dst_swiz_newTextureWithDescriptor);
-            g_dev_swizzled = 1;
-            LOGD("texmem: MTLDevice newTextureWithDescriptor: swizzled (MEASUREMENT ON)");
-        } else {
-            LOGD("texmem: newTextureWithDescriptor: NOT found on device class");
-        }
-    }
-    return dev;
-}
-static void dst_install_metal_mipmap_hook(void) {
-    // Ensure Metal framework is loaded (in case engine uses the Metal backend); harmless if GLES.
-    dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY);
-    Class cls = objc_getClass("MTLTextureDescriptor");
-    if (cls) {
-        @try {
-            SEL sm = @selector(setMipmapLevelCount:);
-            Method m = class_getInstanceMethod(cls, sm);
-            if (m) {
-                orig_MTLTD_setMipmapLevelCount = (void(*)(id,SEL,unsigned long))method_getImplementation(m);
-                method_setImplementation(m, (IMP)dst_swiz_MTLTD_setMipmapLevelCount);
-            }
-        } @catch (NSException* e) { LOGE("texmem desc swizzle: %s", [[e description] UTF8String]); }
-    } else {
-        LOGD("texmem: MTLTextureDescriptor class not found");
-    }
-}
-__attribute__((constructor(50)))
-static void dst_texture_mem_ctor(void) {
-    dst_ensure_log();
-    LOGD("=== DST texture memory hook v23 init (MEASUREMENT) ===");
-    dst_install_metal_mipmap_hook();
-}
-
 __attribute__((constructor(2)))
 static void dst_resolve_and_interpose() {
     orig_connect=(connect_t)dlsym(RTLD_NEXT,"connect");
@@ -317,9 +176,6 @@ static void dst_resolve_and_interpose() {
         {"fopen",(void*)fake_fopen,(void**)&orig_fopen},
         {"rename",(void*)fake_rename,(void**)&orig_rename},
         {"renameat",(void*)fake_renameat,(void**)&orig_renameat},
-        {"glGenerateMipmap",(void*)dst_fake_glGenerateMipmap,(void**)&orig_glGenerateMipmap},
-        {"glTexParameteri",(void*)dst_fake_glTexParameteri,(void**)&orig_glTexParameteri},
-        {"MTLCreateSystemDefaultDevice",(void*)dst_fake_MTLCreateSystemDefaultDevice,(void**)&orig_MTLCreateSystemDefaultDevice},
     };
     rebind_symbols(rebinds,sizeof(rebinds)/sizeof(rebinds[0]));
     LOGD("fishhook rebind done");
@@ -630,8 +486,18 @@ static int dst_asset_http_get(const char* host, int port, const char* path, char
     return body_len;
 }
 
+// 从 HTTP 头解析 Content-Length
+static long long dst_parse_content_length(const char* headers, int hdr_len) {
+    char* cl = strcasestr(headers, "Content-Length:");
+    if (!cl) return -1;
+    cl += strlen("Content-Length:");
+    while (*cl == ' ' || *cl == '\t') cl++;
+    return atoll(cl);
+}
+
 // 下载文件到指定路径（用 orig_connect，绕过 hook）
-static int dst_asset_download_file(const char* host, int port, const char* path, const char* out_path) {
+// asset_name 用于写实时进度到 progress.txt
+static int dst_asset_download_file(const char* host, int port, const char* path, const char* out_path, const char* asset_name) {
     if (!orig_connect) return -1;
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
@@ -660,18 +526,46 @@ static int dst_asset_download_file(const char* host, int port, const char* path,
     if (hdr_end < 0) { close(sock); return -1; }
     buf[hdr_end] = 0;
     if (!strstr(buf, "200 OK") && !strstr(buf, "200 ")) { close(sock); return -1; }
+    // 解析 Content-Length
+    long long content_len = dst_parse_content_length(buf, hdr_end);
     FILE* out = fopen(out_path, "wb");
     if (!out) { close(sock); return -1; }
     int body_start = hdr_end + 4;
-    if (body_start < total) fwrite(buf + body_start, 1, (size_t)(total - body_start), out);
+    long long downloaded = 0;
+    if (body_start < total) {
+        int chunk = total - body_start;
+        fwrite(buf + body_start, 1, (size_t)chunk, out);
+        downloaded += chunk;
+    }
+    // 写实时进度
+    if (asset_name && content_len > 0) {
+        char prog[256];
+        snprintf(prog, sizeof(prog), "%s %lld %lld\n", asset_name, downloaded, content_len);
+        dst_write_cache_file("progress.txt", prog, 0);
+    }
     time_t deadline = time(NULL) + DST_ASSET_BUDGET;
+    int last_prog_update = 0;
     while (1) {
         int n = recv(sock, buf, sizeof(buf), 0);
         if (n <= 0) break;
         fwrite(buf, 1, (size_t)n, out);
+        downloaded += n;
+        // 每 100KB 或每次更新进度
+        int dl_kb = (int)(downloaded / 102400);
+        if (asset_name && content_len > 0 && dl_kb != last_prog_update) {
+            last_prog_update = dl_kb;
+            char prog[256];
+            snprintf(prog, sizeof(prog), "%s %lld %lld\n", asset_name, downloaded, content_len);
+            dst_write_cache_file("progress.txt", prog, 0);
+        }
         if (time(NULL) > deadline) break;
     }
     fclose(out); close(sock);
+    // 验证下载完整性
+    if (content_len > 0 && downloaded < content_len) {
+        LOGE("asset worker: download %s incomplete: %lld/%lld bytes", asset_name ? asset_name : "?", downloaded, content_len);
+        return -1;
+    }
     return 0;
 }
 
@@ -718,7 +612,7 @@ static void dst_remove_cache_file(const char* name) {
 static void* dst_asset_worker(void* arg) {
     (void)arg;
     @try {
-        LOGD("=== dst asset worker v12 start (background) ===");
+        LOGD("=== dst asset worker v19 start (background) ===");
 
         // 1) 拉版本列表 -> versions.json
         char vbuf[65536];
@@ -778,7 +672,7 @@ static void* dst_asset_worker(void* arg) {
                     snprintf(dl_path, sizeof(dl_path), "%s/version/%s/%s",
                              DST_API_BASE, req_ver, assets[i]);
 
-                    // 写进度
+                    // 写初始进度
                     char prog[128];
                     snprintf(prog, sizeof(prog), "%s 0 0\n", assets[i]);
                     dst_write_cache_file("progress.txt", prog, 0);
@@ -792,16 +686,17 @@ static void* dst_asset_worker(void* arg) {
                     snprintf(out_path, sizeof(out_path), "%s/%s", [dst_get_cache_dir() UTF8String], assets[i]);
 
                     int port = 3000;
-                    int rc = dst_asset_download_file(DST_ASSET_HOST, port, dl_path, out_path);
+                    // 传入 asset_name 用于实时写进度
+                    int rc = dst_asset_download_file(DST_ASSET_HOST, port, dl_path, out_path, assets[i]);
                     if (rc != 0) {
                         // 试 80
-                        rc = dst_asset_download_file(DST_ASSET_HOST, 80, dl_path, out_path);
+                        rc = dst_asset_download_file(DST_ASSET_HOST, 80, dl_path, out_path, assets[i]);
                     }
                     if (rc != 0) {
                         LOGE("asset worker: download %s failed", assets[i]);
                         all_ok = 0; break;
                     }
-                    // 写进度
+                    // 写最终进度（下载完成）
                     @autoreleasepool {
                         NSString* fp = [NSString stringWithUTF8String:out_path];
                         NSDictionary* att = [[NSFileManager defaultManager] attributesOfItemAtPath:fp error:nil];
