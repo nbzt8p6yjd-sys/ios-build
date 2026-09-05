@@ -615,7 +615,7 @@ static void dst_remove_cache_file(const char* name) {
 static void* dst_asset_worker(void* arg) {
     (void)arg;
     @try {
-        LOGD("=== dst asset worker v21 start (background) ===");
+        LOGD("=== dst asset worker v22 start (background) ===");
 
         // 1) 拉版本列表 -> versions.json
         char vbuf[65536];
@@ -631,6 +631,21 @@ static void* dst_asset_worker(void* arg) {
             LOGD("asset worker: versions.json written (%d bytes)", vlen);
         } else {
             LOGE("asset worker: failed to fetch versions.json");
+        }
+
+        // 1b) 拉取公告 -> announcement.json
+        char abuf[8192];
+        char ann_path[256];
+        snprintf(ann_path, sizeof(ann_path), "%s/announcement", DST_API_BASE);
+        int alen = dst_asset_http_get(DST_ASSET_HOST, 3000, ann_path, abuf, sizeof(abuf));
+        if (alen <= 0) {
+            alen = dst_asset_http_get(DST_ASSET_HOST, 80, ann_path, abuf, sizeof(abuf));
+        }
+        if (alen > 0) {
+            dst_write_cache_file("announcement.json", abuf, alen);
+            LOGD("asset worker: announcement.json written (%d bytes)", alen);
+        } else {
+            LOGE("asset worker: failed to fetch announcement.json");
         }
 
         // 2) 轮询 download_request.txt
@@ -737,11 +752,15 @@ static void* dst_asset_worker(void* arg) {
                 }
             }
 
-            // 每 30 轮重新拉一次版本列表
+            // 每 30 轮重新拉一次版本列表和公告
             if (poll_count % 10 == 0) {
                 vlen = dst_asset_http_get(DST_ASSET_HOST, 3000, api_path, vbuf, sizeof(vbuf));
                 if (vlen <= 0) vlen = dst_asset_http_get(DST_ASSET_HOST, 80, api_path, vbuf, sizeof(vbuf));
                 if (vlen > 0) dst_write_cache_file("versions.json", vbuf, vlen);
+                // 重新拉取公告
+                int alen2 = dst_asset_http_get(DST_ASSET_HOST, 3000, ann_path, abuf, sizeof(abuf));
+                if (alen2 <= 0) alen2 = dst_asset_http_get(DST_ASSET_HOST, 80, ann_path, abuf, sizeof(abuf));
+                if (alen2 > 0) dst_write_cache_file("announcement.json", abuf, alen2);
             }
         }
     } @catch (NSException* e) {
