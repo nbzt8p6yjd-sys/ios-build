@@ -486,6 +486,9 @@ static int dst_asset_http_get(const char* host, int port, const char* path, char
     return body_len;
 }
 
+// 前向声明（dst_asset_download_file 需要调用 dst_write_cache_file）
+static void dst_write_cache_file(const char* name, const char* content, int len);
+
 // 从 HTTP 头解析 Content-Length
 static long long dst_parse_content_length(const char* headers, int hdr_len) {
     char* cl = strcasestr(headers, "Content-Length:");
