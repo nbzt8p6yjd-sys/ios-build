@@ -531,8 +531,7 @@ static int dst_asset_download_file(const char* host, int port, const char* path,
     if (!strstr(buf, "200 OK") && !strstr(buf, "200 ")) { close(sock); return -1; }
     // 解析 Content-Length
     long long content_len = dst_parse_content_length(buf, hdr_end);
-    // 使用 orig_fopen 绕过 fishhook，避免在下载循环中触发 fake_fopen
-    FILE* out = orig_fopen ? orig_fopen(out_path, "wb") : fopen(out_path, "wb");
+    FILE* out = fopen(out_path, "wb");
     if (!out) { close(sock); return -1; }
     int body_start = hdr_end + 4;
     long long downloaded = 0;
@@ -579,8 +578,7 @@ static void dst_write_cache_file(const char* name, const char* content, int len)
         NSString* dir = dst_get_cache_dir();
         [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
         NSString* path = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
-        // 使用 orig_fopen 绕过 fishhook，避免在后台线程中触发 fake_fopen 导致 SIGSEGV
-        FILE* f = orig_fopen ? orig_fopen([path UTF8String], "wb") : fopen([path UTF8String], "wb");
+        FILE* f = fopen([path UTF8String], "wb");
         if (f) { if (len > 0) fwrite(content, 1, (size_t)len, f); else fputs(content, f); fclose(f); }
     }
 }
@@ -589,8 +587,7 @@ static void dst_write_cache_file(const char* name, const char* content, int len)
 static int dst_read_cache_file(const char* name, char* buf, int buflen) {
     @autoreleasepool {
         NSString* path = [dst_get_cache_dir() stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
-        // 使用 orig_fopen 绕过 fishhook
-        FILE* f = orig_fopen ? orig_fopen([path UTF8String], "r") : fopen([path UTF8String], "r");
+        FILE* f = fopen([path UTF8String], "r");
         if (!f) return -1;
         int n = (int)fread(buf, 1, (size_t)buflen - 1, f);
         buf[n] = 0; fclose(f);
@@ -618,7 +615,7 @@ static void dst_remove_cache_file(const char* name) {
 static void* dst_asset_worker(void* arg) {
     (void)arg;
     @try {
-        LOGD("=== dst asset worker v20 start (background) ===");
+        LOGD("=== dst asset worker v21 start (background) ===");
 
         // 1) 拉版本列表 -> versions.json
         char vbuf[65536];
@@ -721,8 +718,7 @@ static void* dst_asset_worker(void* arg) {
                     char ver_str[128]; ver_str[0] = 0;
                     char ver_path[512];
                     snprintf(ver_path, sizeof(ver_path), "%s/version.txt", [dst_get_cache_dir() UTF8String]);
-                    // 使用 orig_fopen 绕过 fishhook
-                    FILE* vf = orig_fopen ? orig_fopen(ver_path, "r") : fopen(ver_path, "r");
+                    FILE* vf = fopen(ver_path, "r");
                     if (vf) { fgets(ver_str, sizeof(ver_str), vf); fclose(vf);
                         size_t L = strlen(ver_str);
                         while (L > 0 && (ver_str[L-1]=='\n'||ver_str[L-1]=='\r')) ver_str[--L]=0;
