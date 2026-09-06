@@ -93,7 +93,7 @@ __attribute__((constructor(1)))
 static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB v23 (no bg-worker, zip validation, lua-curl) ===");
+    LOGD("=== DYLIB v23b (fix fopen recursion in zip validation) ===");
     signal(SIGILL,dst_signal_handler); signal(SIGSEGV,dst_signal_handler);
     signal(SIGBUS,dst_signal_handler); signal(SIGABRT,dst_signal_handler);
     signal(SIGTRAP,dst_signal_handler); NSSetUncaughtExceptionHandler(dst_uncaught_handler);
@@ -267,7 +267,8 @@ static const char* dst_redirect_lua_path(const char* path) {
 
 static int dst_validate_zip(const char* path) {
     // 验证 ZIP 文件完整性：文件大小 > 1MB，且尾部有 ZIP EOCD 签名 (0x504b0506)
-    FILE* f = fopen(path, "rb");
+    // 用 orig_fopen 避免被 fake_fopen 拦截导致无限递归
+    FILE* f = orig_fopen ? orig_fopen(path, "rb") : fopen(path, "rb");
     if (!f) return 0;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
@@ -797,11 +798,9 @@ static void* dst_asset_worker(void* arg) {
 __attribute__((constructor(99)))
 static void dst_asset_worker_init() {
 dst_ensure_log();
-// v23: 禁用后台 worker 线程，防止 SIGSEGV 导致整个进程闪退
-// 公告拉取和版本下载改为由 Lua 层 (io.popen curl) 处理
-// 文件 hook (fake_fopen/fake_open) 仍然保留，支持 ready.flag 重定向
-LOGD("=== dst_asset_worker: DISABLED (v23, use Lua curl instead) ===");
-// 仍然拉取一次公告和版本列表（同步，不轮询）
+// v23b: 用 dispatch_async 在后台队列拉取公告和版本列表（不阻塞 constructor，不用 pthread）
+LOGD("=== dst_asset_worker: dispatch_async (v23b) ===");
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
 @try {
 char vbuf[65536];
 char api_path[256];
@@ -824,6 +823,7 @@ LOGD("asset init: announcement.json written (%d bytes)", alen);
 } @catch (NSException* e) {
 LOGE("asset init exception: %s", [[e description] UTF8String]);
 }
+});
 }
 
 // ============ 皮肤解锁注入 (IOSVISION v6.1) - 必须保留 ============
