@@ -82,8 +82,8 @@ static void dst_log(const char* fmt, ...) {
 #define LOGE(fmt, ...) do { dst_log("[ERR] " fmt, ##__VA_ARGS__); } while(0)
 
 static void dst_signal_handler(int sig) {
-    const char* name = (sig==SIGILL)?"SIGILL":(sig==SIGSEGV)?"SIGSEGV":(sig==SIGBUS)?"SIGBUS":(sig==SIGABRT)?"SIGABRT":(sig==SIGTRAP)?"SIGTRAP":"SIG?";
-    dst_ensure_log(); if (g_log) { fprintf(g_log,"[PANIC] CRASH signal=%s\n",name); fflush(g_log); } _exit(1);
+const char* name = (sig==SIGILL)?"SIGILL":(sig==SIGSEGV)?"SIGSEGV":(sig==SIGBUS)?"SIGBUS":(sig==SIGABRT)?"SIGABRT":(sig==SIGTRAP)?"SIGTRAP":"SIG?";
+dst_ensure_log(); if (g_log) { fprintf(g_log,"[PANIC] CRASH signal=%s\n",name); fflush(g_log); } _exit(1);
 }
 static void dst_uncaught_handler(NSException* e) {
     dst_ensure_log(); if (g_log && e) { fprintf(g_log,"[PANIC] NSException: %s\n",[[e description] UTF8String]); fflush(g_log); }
@@ -93,7 +93,7 @@ __attribute__((constructor(1)))
 static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB v5.0 (simplified: no bg-download, no watchdog, skin kept) ===");
+    LOGD("=== DYLIB v23 (no bg-worker, zip validation, lua-curl) ===");
     signal(SIGILL,dst_signal_handler); signal(SIGSEGV,dst_signal_handler);
     signal(SIGBUS,dst_signal_handler); signal(SIGABRT,dst_signal_handler);
     signal(SIGTRAP,dst_signal_handler); NSSetUncaughtExceptionHandler(dst_uncaught_handler);
@@ -265,6 +265,22 @@ static const char* dst_redirect_lua_path(const char* path) {
     return path;
 }
 
+static int dst_validate_zip(const char* path) {
+    // 验证 ZIP 文件完整性：文件大小 > 1MB，且尾部有 ZIP EOCD 签名 (0x504b0506)
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz < 1048576) { fclose(f); return 0; } // < 1MB -> invalid
+    // 检查尾部 22 字节是否有 EOCD 签名
+    fseek(f, -22, SEEK_END);
+    unsigned char tail[4];
+    if (fread(tail, 1, 4, f) != 4) { fclose(f); return 0; }
+    fclose(f);
+    // PK\x05\x06 = 0x50 0x4b 0x05 0x06
+    if (tail[0]==0x50 && tail[1]==0x4b && tail[2]==0x05 && tail[3]==0x06) return 1;
+    return 0;
+}
 static const char* dst_redirect_databundle(const char* path) {
     if(!path) return path;
     const char* base=strrchr(path,'/'); base=base?base+1:path;
@@ -275,6 +291,15 @@ static const char* dst_redirect_databundle(const char* path) {
         NSString* nm=[NSString stringWithUTF8String:base];
         NSString* cache=[dst_get_cache_dir() stringByAppendingPathComponent:nm];
         if([[NSFileManager defaultManager] fileExistsAtPath:cache]) {
+            // v23: 验证缓存 ZIP 完整性，防止加载损坏/不完整的 scripts.zip 导致闪退
+            if(!dst_validate_zip([cache UTF8String])) {
+                LOGE("asset redirect: cache %s is invalid, clearing ready.flag", [nm UTF8String]);
+                NSString* readyPath=[dst_get_cache_dir() stringByAppendingPathComponent:@"ready.flag"];
+                [[NSFileManager defaultManager] removeItemAtPath:readyPath error:nil];
+                [[NSFileManager defaultManager] removeItemAtPath:cache error:nil];
+                g_ready_cache = -1; // 强制刷新缓存
+                return path; // 回退到 bundle 中的原始文件
+            }
             strncpy(g_dst_redirect_buf,[cache UTF8String],1023); g_dst_redirect_buf[1023]=0; return g_dst_redirect_buf;
         }
     }
@@ -615,7 +640,7 @@ static void dst_remove_cache_file(const char* name) {
 static void* dst_asset_worker(void* arg) {
     (void)arg;
     @try {
-        LOGD("=== dst asset worker v22 start (background) ===");
+        LOGD("=== dst asset worker v23 start (sync, no polling) ===");
 
         // 1) 拉版本列表 -> versions.json
         char vbuf[65536];
@@ -771,14 +796,34 @@ static void* dst_asset_worker(void* arg) {
 
 __attribute__((constructor(99)))
 static void dst_asset_worker_init() {
-    dst_ensure_log();
-    LOGD("=== dst_asset_worker_init: spawn background worker ===");
-    pthread_t t;
-    if (pthread_create(&t, NULL, dst_asset_worker, NULL) == 0) {
-        pthread_detach(t);
-    } else {
-        LOGE("asset worker: pthread_create failed");
-    }
+dst_ensure_log();
+// v23: 禁用后台 worker 线程，防止 SIGSEGV 导致整个进程闪退
+// 公告拉取和版本下载改为由 Lua 层 (io.popen curl) 处理
+// 文件 hook (fake_fopen/fake_open) 仍然保留，支持 ready.flag 重定向
+LOGD("=== dst_asset_worker: DISABLED (v23, use Lua curl instead) ===");
+// 仍然拉取一次公告和版本列表（同步，不轮询）
+@try {
+char vbuf[65536];
+char api_path[256];
+snprintf(api_path, sizeof(api_path), "%s/versions", DST_API_BASE);
+int vlen = dst_asset_http_get(DST_ASSET_HOST, 3000, api_path, vbuf, sizeof(vbuf));
+if (vlen <= 0) vlen = dst_asset_http_get(DST_ASSET_HOST, 80, api_path, vbuf, sizeof(vbuf));
+if (vlen > 0) {
+dst_write_cache_file("versions.json", vbuf, vlen);
+LOGD("asset init: versions.json written (%d bytes)", vlen);
+}
+char abuf[8192];
+char ann_path[256];
+snprintf(ann_path, sizeof(ann_path), "%s/announcement", DST_API_BASE);
+int alen = dst_asset_http_get(DST_ASSET_HOST, 3000, ann_path, abuf, sizeof(abuf));
+if (alen <= 0) alen = dst_asset_http_get(DST_ASSET_HOST, 80, ann_path, abuf, sizeof(abuf));
+if (alen > 0) {
+dst_write_cache_file("announcement.json", abuf, alen);
+LOGD("asset init: announcement.json written (%d bytes)", alen);
+}
+} @catch (NSException* e) {
+LOGE("asset init exception: %s", [[e description] UTF8String]);
+}
 }
 
 // ============ 皮肤解锁注入 (IOSVISION v6.1) - 必须保留 ============
