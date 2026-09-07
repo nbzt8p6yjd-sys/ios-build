@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <execinfo.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>
@@ -81,9 +82,24 @@ static void dst_log(const char* fmt, ...) {
 #define LOGD(fmt, ...) do { dst_log(fmt, ##__VA_ARGS__); } while(0)
 #define LOGE(fmt, ...) do { dst_log("[ERR] " fmt, ##__VA_ARGS__); } while(0)
 
-static void dst_signal_handler(int sig) {
-const char* name = (sig==SIGILL)?"SIGILL":(sig==SIGSEGV)?"SIGSEGV":(sig==SIGBUS)?"SIGBUS":(sig==SIGABRT)?"SIGABRT":(sig==SIGTRAP)?"SIGTRAP":"SIG?";
-dst_ensure_log(); if (g_log) { fprintf(g_log,"[PANIC] CRASH signal=%s\n",name); fflush(g_log); } _exit(1);
+static void dst_signal_handler(int sig, siginfo_t* info, void* uctx) {
+    (void)uctx;
+    const char* name = (sig==SIGILL)?"SIGILL":(sig==SIGSEGV)?"SIGSEGV":(sig==SIGBUS)?"SIGBUS":(sig==SIGABRT)?"SIGABRT":(sig==SIGTRAP)?"SIGTRAP":"SIG?";
+    dst_ensure_log();
+    if (g_log) {
+        void* fault = info ? info->si_addr : (void*)0;
+        fprintf(g_log, "[PANIC] CRASH signal=%s fault_addr=%p\n", name, fault);
+        // 回溯（async-signal-unsafe，但仅用于一次性诊断后 _exit，可接受）
+        void* frames[40];
+        int n = backtrace(frames, 40);
+        char** syms = backtrace_symbols(frames, n);
+        for (int i = 0; i < n; i++) {
+            fprintf(g_log, "  #%d %s\n", i, syms[i] ? syms[i] : "?");
+        }
+        if (syms) free(syms);
+        fflush(g_log);
+    }
+    _exit(1);
 }
 static void dst_uncaught_handler(NSException* e) {
     dst_ensure_log(); if (g_log && e) { fprintf(g_log,"[PANIC] NSException: %s\n",[[e description] UTF8String]); fflush(g_log); }
@@ -94,9 +110,17 @@ static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
     LOGD("=== DYLIB v24 (C-level auth gating, based on v22) ===");
-    signal(SIGILL,dst_signal_handler); signal(SIGSEGV,dst_signal_handler);
-    signal(SIGBUS,dst_signal_handler); signal(SIGABRT,dst_signal_handler);
-    signal(SIGTRAP,dst_signal_handler); NSSetUncaughtExceptionHandler(dst_uncaught_handler);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = dst_signal_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+    NSSetUncaughtExceptionHandler(dst_uncaught_handler);
 }
 
 static int is_loopback(uint32_t ip_net) { uint32_t ip=ntohl(ip_net); return (ip&0xFF000000u)==0x7F000000u; }
@@ -187,6 +211,7 @@ static int path_is_cluster_token(const char* p) { return p && strstr(p,"cluster_
 static int open_is_read(int f) { return (f&3)==O_RDONLY; }
 static const char b64[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static void gen_klei_token(char*buf,size_t bl) {
+    if(!buf||bl<8){ if(buf&&bl>0) buf[0]=0; return; }
     strncpy(buf,"pds-g",bl); buf+=5; bl-=5;
     srand((unsigned)(time(NULL)^getpid()));
     for(size_t i=0;i+1<bl;i++) buf[i]=b64[rand()%64];
@@ -210,7 +235,7 @@ static void ensure_cluster_token_at(const char*path,int dirfd,openat_t ropen) {
 }
 static int g_tok_wfd=-1; static char g_tok_wpath[512];
 static void record_tok_write_fd(int fd,const char*path,int flags) {
-    if(fd<0||!path||!path_is_cluster_token(path)) return;
+    if(fd<0||!path||g_open_reent||!path_is_cluster_token(path)) return;
     if(strchr("wa",(char)(flags&3))||(flags&O_CREAT)) { g_tok_wfd=fd; strncpy(g_tok_wpath,path,511); g_tok_wpath[511]=0; }
 }
 static void rewrite_cluster_token_on_close() {
@@ -250,6 +275,7 @@ static const char* dst_redirect_lua_path(const char* path) {
     if(!path) return path;
     // 检查是否是 ../Documents/... 路径
     if(strncmp(path, "../Documents/", 13) != 0) return path;
+    g_open_reent = 1; // 防同线程重入改写共享缓冲 g_lua_redirect_buf（Foundation 内部会回调被 hook 的 open/openat）
     @autoreleasepool {
         NSString* rel = [NSString stringWithUTF8String:path+13]; // 跳过 ../Documents/
         NSString* abs = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:rel];
@@ -260,8 +286,10 @@ static const char* dst_redirect_lua_path(const char* path) {
         // 这样写模式也能正确重定向到沙箱目录
         strncpy(g_lua_redirect_buf, [abs UTF8String], 1023);
         g_lua_redirect_buf[1023] = 0;
+        g_open_reent = 0;
         return g_lua_redirect_buf;
     }
+    g_open_reent = 0;
     return path;
 }
 
@@ -270,14 +298,16 @@ static const char* dst_redirect_databundle(const char* path) {
     const char* base=strrchr(path,'/'); base=base?base+1:path;
     int hit=0; for(int i=0;i<2;i++) if(strcmp(base,g_dst_db_names[i])==0){hit=1;break;}
     if(!hit) return path;
-    if(!dst_assets_ready()) return path;
+    g_open_reent = 1; // 防同线程重入改写共享缓冲 g_dst_redirect_buf
+    if(!dst_assets_ready()) { g_open_reent = 0; return path; }
     @autoreleasepool {
         NSString* nm=[NSString stringWithUTF8String:base];
         NSString* cache=[dst_get_cache_dir() stringByAppendingPathComponent:nm];
         if([[NSFileManager defaultManager] fileExistsAtPath:cache]) {
-            strncpy(g_dst_redirect_buf,[cache UTF8String],1023); g_dst_redirect_buf[1023]=0; return g_dst_redirect_buf;
+            strncpy(g_dst_redirect_buf,[cache UTF8String],1023); g_dst_redirect_buf[1023]=0; g_open_reent = 0; return g_dst_redirect_buf;
         }
     }
+    g_open_reent = 0;
     return path;
 }
 
@@ -439,6 +469,22 @@ static NSString* dst_get_cache_dir() {
 }
 
 // 用 orig_connect 直连（绕过 fishhook，不触发 SIGSEGV）
+
+// 读取玩家授权码（即 Documents/ios_auth_token.txt 内容），用于下载鉴权。
+// 服务端 /dst/ 与 /api/version/{id}/{asset} 要求 ?code=<授权码>，否则返回 403。
+static void dst_dl_path_with_code(const char* path, char* out, int outsz) {
+    char code[256]; code[0] = 0;
+    @autoreleasepool {
+        NSString* p = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                        stringByAppendingPathComponent:@"ios_auth_token.txt"];
+        FILE* f = fopen([p UTF8String], "r");
+        if (f) { size_t n = fread(code, 1, sizeof(code) - 1, f); fclose(f); code[n] = 0;
+            while (n > 0 && (code[n-1] == '\n' || code[n-1] == '\r')) code[--n] = 0; }
+    }
+    if (code[0]) snprintf(out, outsz, "%s?code=%s", path, code);
+    else { strncpy(out, path, outsz - 1); out[outsz - 1] = 0; }
+}
+
 static int dst_asset_http_get(const char* host, int port, const char* path, char* buf, int buflen) {
     if (!orig_connect) return -1;
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -450,10 +496,12 @@ static int dst_asset_http_get(const char* host, int port, const char* path, char
     sa.sin_family = AF_INET; sa.sin_port = htons(port);
     sa.sin_addr.s_addr = inet_addr(host);
     if (orig_connect(sock, (const struct sockaddr*)&sa, sizeof(sa)) != 0) { close(sock); return -1; }
+    char dlpath[768];
+    dst_dl_path_with_code(path, dlpath, sizeof(dlpath));
     char req[512];
     int rl = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: DSTIOS/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-        path, host);
+        dlpath, host);
     if (send(sock, req, (size_t)rl, 0) <= 0) { close(sock); return -1; }
     int total = 0; int hdr_end = -1;
     // 阶段1：接收直到找到 HTTP 头结束
@@ -511,10 +559,12 @@ static int dst_asset_download_file(const char* host, int port, const char* path,
     sa.sin_family = AF_INET; sa.sin_port = htons(port);
     sa.sin_addr.s_addr = inet_addr(host);
     if (orig_connect(sock, (const struct sockaddr*)&sa, sizeof(sa)) != 0) { close(sock); return -1; }
+    char dlpath[768];
+    dst_dl_path_with_code(path, dlpath, sizeof(dlpath));
     char req[512];
     int rl = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: DSTIOS/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-        path, host);
+        dlpath, host);
     if (send(sock, req, (size_t)rl, 0) <= 0) { close(sock); return -1; }
     char buf[65536]; int total = 0; int hdr_end = -1;
     while (total < (int)sizeof(buf)) {
