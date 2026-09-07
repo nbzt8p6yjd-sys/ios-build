@@ -705,6 +705,16 @@ static void* dst_asset_worker(void* arg) {
             if (rlen > 0 && req_ver[0] != 0) {
                 LOGD("asset worker: download request for version '%s'", req_ver);
 
+                // v24: 下载前检查授权，未授权拒绝下载
+                if (!dst_is_authed()) {
+                    LOGE("asset worker: NOT AUTHED, rejecting download request");
+                    dst_remove_cache_file("download_request.txt");
+                    char err[256];
+                    snprintf(err, sizeof(err), "error: not authorized\n");
+                    dst_write_cache_file("pending_version.txt", err, 0);
+                } else {
+                LOGD("asset worker: AUTHED, proceeding with download");
+
                 // 检查是否已在下载（简单防重：删请求文件）
                 dst_remove_cache_file("download_request.txt");
 
@@ -776,17 +786,21 @@ static void* dst_asset_worker(void* arg) {
                     snprintf(err_msg, sizeof(err_msg), "error: download %s failed\n", req_ver);
                     dst_write_cache_file("pending_version.txt", err_msg, 0);
                 }
+                } // end auth check else
             }
 
-            // 每 30 轮重新拉一次版本列表和公告
+            // 每 30 轮重新拉一次版本列表和公告（v24: 版本列表也加授权检查）
             if (poll_count % 10 == 0) {
-                vlen = dst_asset_http_get(DST_ASSET_HOST, 3000, api_path, vbuf, sizeof(vbuf));
-                if (vlen <= 0) vlen = dst_asset_http_get(DST_ASSET_HOST, 80, api_path, vbuf, sizeof(vbuf));
-                if (vlen > 0) dst_write_cache_file("versions.json", vbuf, vlen);
-                // 重新拉取公告
+                // 公告不需要授权
                 int alen2 = dst_asset_http_get(DST_ASSET_HOST, 3000, ann_path, abuf, sizeof(abuf));
                 if (alen2 <= 0) alen2 = dst_asset_http_get(DST_ASSET_HOST, 80, ann_path, abuf, sizeof(abuf));
                 if (alen2 > 0) dst_write_cache_file("announcement.json", abuf, alen2);
+                // 版本列表需要授权
+                if (dst_is_authed()) {
+                    vlen = dst_asset_http_get(DST_ASSET_HOST, 3000, api_path, vbuf, sizeof(vbuf));
+                    if (vlen <= 0) vlen = dst_asset_http_get(DST_ASSET_HOST, 80, api_path, vbuf, sizeof(vbuf));
+                    if (vlen > 0) dst_write_cache_file("versions.json", vbuf, vlen);
+                }
             }
         }
     } @catch (NSException* e) {
@@ -798,10 +812,29 @@ static void* dst_asset_worker(void* arg) {
 __attribute__((constructor(99)))
 static void dst_asset_worker_init() {
 dst_ensure_log();
-// v23b: 用 dispatch_async 在后台队列拉取公告和版本列表（不阻塞 constructor，不用 pthread）
-LOGD("=== dst_asset_worker: dispatch_async (v23b) ===");
+// v24: dispatch_async 拉取公告和版本列表（不阻塞 constructor，不用 pthread）
+// v24 关键改动：版本列表拉取前检查授权 token，未授权不拉取版本列表
+LOGD("=== dst_asset_worker: dispatch_async (v24, auth-gated) ===");
 dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
 @try {
+// 公告不需要授权，先拉
+char abuf[8192];
+char ann_path[256];
+snprintf(ann_path, sizeof(ann_path), "%s/announcement", DST_API_BASE);
+int alen = dst_asset_http_get(DST_ASSET_HOST, 3000, ann_path, abuf, sizeof(abuf));
+if (alen <= 0) alen = dst_asset_http_get(DST_ASSET_HOST, 80, ann_path, abuf, sizeof(abuf));
+if (alen > 0) {
+dst_write_cache_file("announcement.json", abuf, alen);
+LOGD("asset init: announcement.json written (%d bytes)", alen);
+}
+
+// 版本列表需要授权检查：未授权不拉取版本列表，也不写 versions.json
+if (!dst_is_authed()) {
+LOGD("asset init: NOT AUTHED, skipping versions.json fetch");
+// 写一个空的 versions.json，让 Lua 端显示"无可用版本"
+dst_write_cache_file("versions.json", "{\"ok\":true,\"versions\":[]}", 28);
+} else {
+LOGD("asset init: AUTHED, fetching versions.json");
 char vbuf[65536];
 char api_path[256];
 snprintf(api_path, sizeof(api_path), "%s/versions", DST_API_BASE);
@@ -811,14 +844,6 @@ if (vlen > 0) {
 dst_write_cache_file("versions.json", vbuf, vlen);
 LOGD("asset init: versions.json written (%d bytes)", vlen);
 }
-char abuf[8192];
-char ann_path[256];
-snprintf(ann_path, sizeof(ann_path), "%s/announcement", DST_API_BASE);
-int alen = dst_asset_http_get(DST_ASSET_HOST, 3000, ann_path, abuf, sizeof(abuf));
-if (alen <= 0) alen = dst_asset_http_get(DST_ASSET_HOST, 80, ann_path, abuf, sizeof(abuf));
-if (alen > 0) {
-dst_write_cache_file("announcement.json", abuf, alen);
-LOGD("asset init: announcement.json written (%d bytes)", alen);
 }
 } @catch (NSException* e) {
 LOGE("asset init exception: %s", [[e description] UTF8String]);
