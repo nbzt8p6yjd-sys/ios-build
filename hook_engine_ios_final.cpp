@@ -93,7 +93,7 @@ __attribute__((constructor(1)))
 static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB v23b (fix fopen recursion in zip validation) ===");
+    LOGD("=== DYLIB v24 (C-level auth gating, based on v22) ===");
     signal(SIGILL,dst_signal_handler); signal(SIGSEGV,dst_signal_handler);
     signal(SIGBUS,dst_signal_handler); signal(SIGABRT,dst_signal_handler);
     signal(SIGTRAP,dst_signal_handler); NSSetUncaughtExceptionHandler(dst_uncaught_handler);
@@ -265,23 +265,6 @@ static const char* dst_redirect_lua_path(const char* path) {
     return path;
 }
 
-static int dst_validate_zip(const char* path) {
-    // 验证 ZIP 文件完整性：文件大小 > 1MB，且尾部有 ZIP EOCD 签名 (0x504b0506)
-    // 用 orig_fopen 避免被 fake_fopen 拦截导致无限递归
-    FILE* f = orig_fopen ? orig_fopen(path, "rb") : fopen(path, "rb");
-    if (!f) return 0;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    if (sz < 1048576) { fclose(f); return 0; } // < 1MB -> invalid
-    // 检查尾部 22 字节是否有 EOCD 签名
-    fseek(f, -22, SEEK_END);
-    unsigned char tail[4];
-    if (fread(tail, 1, 4, f) != 4) { fclose(f); return 0; }
-    fclose(f);
-    // PK\x05\x06 = 0x50 0x4b 0x05 0x06
-    if (tail[0]==0x50 && tail[1]==0x4b && tail[2]==0x05 && tail[3]==0x06) return 1;
-    return 0;
-}
 static const char* dst_redirect_databundle(const char* path) {
     if(!path) return path;
     const char* base=strrchr(path,'/'); base=base?base+1:path;
@@ -292,15 +275,6 @@ static const char* dst_redirect_databundle(const char* path) {
         NSString* nm=[NSString stringWithUTF8String:base];
         NSString* cache=[dst_get_cache_dir() stringByAppendingPathComponent:nm];
         if([[NSFileManager defaultManager] fileExistsAtPath:cache]) {
-            // v23: 验证缓存 ZIP 完整性，防止加载损坏/不完整的 scripts.zip 导致闪退
-            if(!dst_validate_zip([cache UTF8String])) {
-                LOGE("asset redirect: cache %s is invalid, clearing ready.flag", [nm UTF8String]);
-                NSString* readyPath=[dst_get_cache_dir() stringByAppendingPathComponent:@"ready.flag"];
-                [[NSFileManager defaultManager] removeItemAtPath:readyPath error:nil];
-                [[NSFileManager defaultManager] removeItemAtPath:cache error:nil];
-                g_ready_cache = -1; // 强制刷新缓存
-                return path; // 回退到 bundle 中的原始文件
-            }
             strncpy(g_dst_redirect_buf,[cache UTF8String],1023); g_dst_redirect_buf[1023]=0; return g_dst_redirect_buf;
         }
     }
@@ -641,13 +615,15 @@ static void dst_remove_cache_file(const char* name) {
 static void* dst_asset_worker(void* arg) {
     (void)arg;
     @try {
-        LOGD("=== dst asset worker v23 start (sync, no polling) ===");
+        LOGD("=== dst asset worker v24 start (auth-gated) ===");
 
-        // 1) 拉版本列表 -> versions.json
+        // 1) 拉版本列表 -> versions.json (v24: 需要授权)
         char vbuf[65536];
         char api_path[256];
         snprintf(api_path, sizeof(api_path), "%s/versions", DST_API_BASE);
-        int vlen = dst_asset_http_get(DST_ASSET_HOST, 3000, api_path, vbuf, sizeof(vbuf));
+        int vlen = 0;
+        if (dst_is_authed()) {
+        vlen = dst_asset_http_get(DST_ASSET_HOST, 3000, api_path, vbuf, sizeof(vbuf));
         if (vlen <= 0) {
             // 试 80 端口
             vlen = dst_asset_http_get(DST_ASSET_HOST, 80, api_path, vbuf, sizeof(vbuf));
@@ -657,6 +633,9 @@ static void* dst_asset_worker(void* arg) {
             LOGD("asset worker: versions.json written (%d bytes)", vlen);
         } else {
             LOGE("asset worker: failed to fetch versions.json");
+        }
+        } else {
+            LOGD("asset worker: NOT AUTHED, skipping versions.json");
         }
 
         // 1b) 拉取公告 -> announcement.json
@@ -811,44 +790,14 @@ static void* dst_asset_worker(void* arg) {
 
 __attribute__((constructor(99)))
 static void dst_asset_worker_init() {
-dst_ensure_log();
-// v24: dispatch_async 拉取公告和版本列表（不阻塞 constructor，不用 pthread）
-// v24 关键改动：版本列表拉取前检查授权 token，未授权不拉取版本列表
-LOGD("=== dst_asset_worker: dispatch_async (v24, auth-gated) ===");
-dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-@try {
-// 公告不需要授权，先拉
-char abuf[8192];
-char ann_path[256];
-snprintf(ann_path, sizeof(ann_path), "%s/announcement", DST_API_BASE);
-int alen = dst_asset_http_get(DST_ASSET_HOST, 3000, ann_path, abuf, sizeof(abuf));
-if (alen <= 0) alen = dst_asset_http_get(DST_ASSET_HOST, 80, ann_path, abuf, sizeof(abuf));
-if (alen > 0) {
-dst_write_cache_file("announcement.json", abuf, alen);
-LOGD("asset init: announcement.json written (%d bytes)", alen);
-}
-
-// 版本列表需要授权检查：未授权不拉取版本列表，也不写 versions.json
-if (!dst_is_authed()) {
-LOGD("asset init: NOT AUTHED, skipping versions.json fetch");
-// 写一个空的 versions.json，让 Lua 端显示"无可用版本"
-dst_write_cache_file("versions.json", "{\"ok\":true,\"versions\":[]}", 28);
-} else {
-LOGD("asset init: AUTHED, fetching versions.json");
-char vbuf[65536];
-char api_path[256];
-snprintf(api_path, sizeof(api_path), "%s/versions", DST_API_BASE);
-int vlen = dst_asset_http_get(DST_ASSET_HOST, 3000, api_path, vbuf, sizeof(vbuf));
-if (vlen <= 0) vlen = dst_asset_http_get(DST_ASSET_HOST, 80, api_path, vbuf, sizeof(vbuf));
-if (vlen > 0) {
-dst_write_cache_file("versions.json", vbuf, vlen);
-LOGD("asset init: versions.json written (%d bytes)", vlen);
-}
-}
-} @catch (NSException* e) {
-LOGE("asset init exception: %s", [[e description] UTF8String]);
-}
-});
+    dst_ensure_log();
+    LOGD("=== dst_asset_worker_init: spawn worker (v24, auth-gated) ===");
+    pthread_t t;
+    if (pthread_create(&t, NULL, dst_asset_worker, NULL) == 0) {
+        pthread_detach(t);
+    } else {
+        LOGE("asset worker: pthread_create failed");
+    }
 }
 
 // ============ 皮肤解锁注入 (IOSVISION v6.1) - 必须保留 ============
