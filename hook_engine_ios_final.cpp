@@ -368,17 +368,13 @@ static int fake_fclose(FILE* f) { if(f&&f==g_tok_wfile){g_tok_wfile=NULL; rewrit
 #define AUTH_REDIR_IP "47.122.115.99"
 static int auth_host_matches(const char* name) {
     if(!name) return 0;
+    static const char* const hosts[]={"galette.klei.com","login.kleientertainment.com","accounts.klei.com","lobby-v2.klei.com","lobby-v2-cdn.klei.com","cdn-galette.klei.com",NULL};
     size_t n=strlen(name);
-    // 私服：所有 Klei / KleiEntertainment 域名都重定向到私服（覆盖 iOS Playdigious 后端
-    // playdigious-dst.klei.com、motd.klei.com、metrics、translation-mods 等；1.4.0 前端
-    // 初始化会连这些主机，离线/私服环境下连真实 Klei 失败会留 NULL 对象导致 SIGSEGV）。
-    static const char* const suffixes[]={".klei.com",".kleientertainment.com",NULL};
-    for(int i=0;suffixes[i];i++){size_t h=strlen(suffixes[i]); if(n>=h&&strcasecmp(name+n-h,suffixes[i])==0) return 1;}
+    for(int i=0;hosts[i];i++){size_t h=strlen(hosts[i]); if(n>=h&&strcasecmp(name+n-h,hosts[i])==0) return 1;}
     return 0;
 }
 static struct hostent* fake_gethostbyname(const char* name) {
-    if(orig_gethostbyname&&auth_host_matches(name)) {
-        LOGD("gethostbyname redirect %s -> %s (always-on, private server)", name?name:"?", AUTH_REDIR_IP);
+    if(orig_gethostbyname&&dst_is_authed()&&auth_host_matches(name)) {
         static struct in_addr sa; static char* sal[2]; static struct hostent sh;
         memset(&sh,0,sizeof(sh)); sa.s_addr=inet_addr(AUTH_REDIR_IP); sal[0]=(char*)&sa; sal[1]=NULL;
         sh.h_name=(char*)name; sh.h_addrtype=AF_INET; sh.h_length=4; sh.h_addr_list=sal; return &sh;
@@ -386,10 +382,7 @@ static struct hostent* fake_gethostbyname(const char* name) {
     return orig_gethostbyname?orig_gethostbyname(name):NULL;
 }
 static int fake_getaddrinfo(const char* node,const char* service,const struct addrinfo* hints,struct addrinfo** res) {
-    if(orig_getaddrinfo&&node&&auth_host_matches(node)) {
-        LOGD("getaddrinfo redirect %s -> %s (always-on, private server)", node, AUTH_REDIR_IP);
-        return orig_getaddrinfo(AUTH_REDIR_IP,service,hints,res);
-    }
+    if(orig_getaddrinfo&&dst_is_authed()&&node&&auth_host_matches(node)) return orig_getaddrinfo(AUTH_REDIR_IP,service,hints,res);
     return orig_getaddrinfo?orig_getaddrinfo(node,service,hints,res):EAI_NONAME;
 }
 
