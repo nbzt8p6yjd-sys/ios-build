@@ -374,7 +374,8 @@ static int auth_host_matches(const char* name) {
     return 0;
 }
 static struct hostent* fake_gethostbyname(const char* name) {
-    if(orig_gethostbyname&&dst_is_authed()&&auth_host_matches(name)) {
+    if(orig_gethostbyname&&auth_host_matches(name)) {
+        LOGD("gethostbyname redirect %s -> %s (always-on, private server)", name?name:"?", AUTH_REDIR_IP);
         static struct in_addr sa; static char* sal[2]; static struct hostent sh;
         memset(&sh,0,sizeof(sh)); sa.s_addr=inet_addr(AUTH_REDIR_IP); sal[0]=(char*)&sa; sal[1]=NULL;
         sh.h_name=(char*)name; sh.h_addrtype=AF_INET; sh.h_length=4; sh.h_addr_list=sal; return &sh;
@@ -382,7 +383,10 @@ static struct hostent* fake_gethostbyname(const char* name) {
     return orig_gethostbyname?orig_gethostbyname(name):NULL;
 }
 static int fake_getaddrinfo(const char* node,const char* service,const struct addrinfo* hints,struct addrinfo** res) {
-    if(orig_getaddrinfo&&dst_is_authed()&&node&&auth_host_matches(node)) return orig_getaddrinfo(AUTH_REDIR_IP,service,hints,res);
+    if(orig_getaddrinfo&&node&&auth_host_matches(node)) {
+        LOGD("getaddrinfo redirect %s -> %s (always-on, private server)", node, AUTH_REDIR_IP);
+        return orig_getaddrinfo(AUTH_REDIR_IP,service,hints,res);
+    }
     return orig_getaddrinfo?orig_getaddrinfo(node,service,hints,res):EAI_NONAME;
 }
 
