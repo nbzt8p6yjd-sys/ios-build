@@ -368,9 +368,12 @@ static int fake_fclose(FILE* f) { if(f&&f==g_tok_wfile){g_tok_wfile=NULL; rewrit
 #define AUTH_REDIR_IP "47.122.115.99"
 static int auth_host_matches(const char* name) {
     if(!name) return 0;
-    static const char* const hosts[]={"galette.klei.com","login.kleientertainment.com","accounts.klei.com","lobby-v2.klei.com","lobby-v2-cdn.klei.com","cdn-galette.klei.com",NULL};
     size_t n=strlen(name);
-    for(int i=0;hosts[i];i++){size_t h=strlen(hosts[i]); if(n>=h&&strcasecmp(name+n-h,hosts[i])==0) return 1;}
+    // 私服：所有 Klei / KleiEntertainment 域名都重定向到私服（覆盖 iOS Playdigious 后端
+    // playdigious-dst.klei.com、motd.klei.com、metrics、translation-mods 等；1.4.0 前端
+    // 初始化会连这些主机，离线/私服环境下连真实 Klei 失败会留 NULL 对象导致 SIGSEGV）。
+    static const char* const suffixes[]={".klei.com",".kleientertainment.com",NULL};
+    for(int i=0;suffixes[i];i++){size_t h=strlen(suffixes[i]); if(n>=h&&strcasecmp(name+n-h,suffixes[i])==0) return 1;}
     return 0;
 }
 static struct hostent* fake_gethostbyname(const char* name) {
