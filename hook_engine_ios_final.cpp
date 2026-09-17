@@ -316,25 +316,37 @@ static const char* dst_redirect_databundle(const char* path) {
 // ---- file hooks ----
 static int fake_open(const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode);
-    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+    if(!g_open_reent) {  /* v25: 写模式也重定向 lua_path —— 2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读，写就落进只读 bundle（无法写入下载请求）；databundle 仍只对读重定向 */
+        if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+        const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
+    }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token(path,orig_open); g_open_reent=0;}
     int fd=orig_open?orig_open(path,flags,mode):open(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
 static int fake_open_nocancel(const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode); open_t real=orig_open_nocancel?orig_open_nocancel:orig_open;
-    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=real(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=real(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+    if(!g_open_reent) {  /* v25: 写模式也重定向 lua_path —— 2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读，写就落进只读 bundle（无法写入下载请求）；databundle 仍只对读重定向 */
+        if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=real(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+        const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=real(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
+    }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token(path,real); g_open_reent=0;}
     int fd=real(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
 static int fake_openat(int dirfd,const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode);
-    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+    if(!g_open_reent) {  /* v25: 写模式也重定向 lua_path —— 2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读，写就落进只读 bundle（无法写入下载请求）；databundle 仍只对读重定向 */
+        if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+        const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
+    }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token_at(path,dirfd,orig_openat); g_open_reent=0;}
     int fd=orig_openat?orig_openat(dirfd,path,flags,mode):openat(dirfd,path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
 static int fake_openat_nocancel(int dirfd,const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode); openat_t real=orig_openat_nocancel?orig_openat_nocancel:orig_openat;
-    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+    if(!g_open_reent) {  /* v25: 写模式也重定向 lua_path —— 2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读，写就落进只读 bundle（无法写入下载请求）；databundle 仍只对读重定向 */
+        if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
+        const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
+    }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token_at(path,dirfd,real); g_open_reent=0;}
     int fd=real(dirfd,path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
