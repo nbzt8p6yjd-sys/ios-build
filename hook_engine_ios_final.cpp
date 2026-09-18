@@ -93,7 +93,7 @@ __attribute__((constructor(1)))
 static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB v5.1 diag (simplified: no bg-download, no watchdog, skin kept) ===");
+    LOGD("=== DYLIB v5.2 strip (simplified: no bg-download, no watchdog, skin kept) ===");
     signal(SIGILL,dst_signal_handler); signal(SIGSEGV,dst_signal_handler);
     signal(SIGBUS,dst_signal_handler); signal(SIGABRT,dst_signal_handler);
     signal(SIGTRAP,dst_signal_handler); NSSetUncaughtExceptionHandler(dst_uncaught_handler);
@@ -287,6 +287,9 @@ static const char* dst_redirect_databundle(const char* path) {
 static void diag_log(const char* who, const char* path, const char* mode, int flags, const char* red) {
     if(!path) return;
     if(!strstr(path, "dst_assets_cache")) return;   /* 只看 Lua 的缓存目录 */
+    /* [v22w] 只报「写模式」：读是 UI 每帧轮询（实测 30s 内 2000+ 次），会把日志刷爆 */
+    if(mode) { if(!strchr(mode,'w') && !strchr(mode,'a') && !strchr(mode,'+')) return; }
+    else     { if((flags & 3) == 0) return; }   /* 低 2 位 = O_RDONLY */
     if(mode) LOGD("[DIAG] %s(path=%s, mode=%s) -> %s", who, path, mode, red?red:"(no-redirect)");
     else     LOGD("[DIAG] %s(path=%s, flags=0x%x) -> %s", who, path, flags, red?red:"(no-redirect)");
 }
@@ -609,6 +612,25 @@ static void dst_write_cache_file(const char* name, const char* content, int len)
 }
 
 // 读 Documents/dst_assets_cache/ 文件
+/* [v22w] 剥离引擎持久化通道写出的文件头 "KLEI     1 "（KLEI + 空格 + 版本号 + 空格）。
+   背景：2.1.0 引擎把 Lua 的 io.open 写模式直接拒了（写请求到不了 libc —— dylib 的
+   fopen/open/openat/openat_nocancel 钩子一个都拦不到），只能让 Lua 改走引擎自己的
+   保存通道（TheSim:SetPersistentString / SavePersistentString），该通道写出的文件带这个头。
+   1.4.2 走原生 io.open 写入、文件不含头 => 本函数为纯 no-op，对旧版本零影响。 */
+static int dst_strip_klei_header(char* buf, int* plen) {
+    int n = *plen;
+    if(n < 4 || memcmp(buf, "KLEI", 4) != 0) return 0;
+    int i = 4;
+    while(i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
+    while(i < n && buf[i] >= '0' && buf[i] <= '9') i++;
+    if(i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
+    int rest = n - i; if(rest < 0) rest = 0;
+    memmove(buf, buf + i, (size_t)rest);
+    buf[rest] = 0;
+    *plen = rest;
+    return 1;
+}
+
 static int dst_read_cache_file(const char* name, char* buf, int buflen) {
     @autoreleasepool {
         NSString* path = [dst_get_cache_dir() stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
@@ -618,6 +640,10 @@ static int dst_read_cache_file(const char* name, char* buf, int buflen) {
         buf[n] = 0; fclose(f);
         // trim
         while (n > 0 && (buf[n-1]=='\n' || buf[n-1]=='\r' || buf[n-1]==' ')) buf[--n] = 0;
+        // [v22w] 引擎通道写出的文件带头 "KLEI <ver> "：剥掉，否则版本号会被污染
+        if (dst_strip_klei_header(buf, &n)) {
+            LOGD("cache read: stripped KLEI header -> '%s'", buf);
+        }
         return n;
     }
 }
