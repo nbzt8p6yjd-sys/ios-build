@@ -93,7 +93,7 @@ __attribute__((constructor(1)))
 static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB v5.2 strip (simplified: no bg-download, no watchdog, skin kept) ===");
+    LOGD("=== DYLIB v5.3 strip2 (simplified: no bg-download, no watchdog, skin kept) ===");
     signal(SIGILL,dst_signal_handler); signal(SIGSEGV,dst_signal_handler);
     signal(SIGBUS,dst_signal_handler); signal(SIGABRT,dst_signal_handler);
     signal(SIGTRAP,dst_signal_handler); NSSetUncaughtExceptionHandler(dst_uncaught_handler);
@@ -348,12 +348,12 @@ static FILE* fake_fopen(const char* path,const char* mode) {
     if(!g_open_reent && mode) {
         // 读模式：先检查 databundle 重定向，再检查 lua_path 重定向
         if(mode[0]=='r' && !strchr(mode,'+')) {
-            const char* red=dst_redirect_databundle(path); if(red!=path) diag_log("fopen", path, mode, 0, red); return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
-            red=dst_redirect_lua_path(path); if(red!=path) diag_log("fopen", path, mode, 0, red); return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+            const char* red=dst_redirect_databundle(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+            red=dst_redirect_lua_path(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
         }
         // 写模式：只做 lua_path 重定向（databundle 不需要写重定向）
         if(strchr(mode,'w')||strchr(mode,'a')||strchr(mode,'+')) {
-            const char* red=dst_redirect_lua_path(path); if(red!=path) diag_log("fopen", path, mode, 0, red); return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+            const char* red=dst_redirect_lua_path(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
         }
     }
     FILE* f=orig_fopen?orig_fopen(path,mode):fopen(path,mode);
