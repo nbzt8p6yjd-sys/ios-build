@@ -93,7 +93,7 @@ __attribute__((constructor(1)))
 static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB v5.5 pathfix2 (simplified: no bg-download, no watchdog, skin kept) ===");
+    LOGD("=== DYLIB v5.6 pathfix ===");
     signal(SIGILL,dst_signal_handler); signal(SIGSEGV,dst_signal_handler);
     signal(SIGBUS,dst_signal_handler); signal(SIGABRT,dst_signal_handler);
     signal(SIGTRAP,dst_signal_handler); NSSetUncaughtExceptionHandler(dst_uncaught_handler);
@@ -248,44 +248,46 @@ static int dst_assets_ready(void) {
 static char g_lua_redirect_buf[1024];
 static const char* dst_redirect_lua_path(const char* path) {
     if(!path) return path;
-    // ---- 规则1（原版）：../Documents/... 相对路径 ----
-    if(strncmp(path, "../Documents/", 13) == 0) {
-        @autoreleasepool {
-            NSString* rel = [NSString stringWithUTF8String:path+13]; // 跳过 ../Documents/
-            NSString* abs = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:rel];
-            // 确保父目录存在（写模式创建文件时父目录可能不存在）
-            NSString* parentDir = [abs stringByDeletingLastPathComponent];
-            [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
-            strncpy(g_lua_redirect_buf, [abs UTF8String], 1023);
-            g_lua_redirect_buf[1023] = 0;
-            return g_lua_redirect_buf;
-        }
+    // 检查是否是 ../Documents/... 路径
+    if(strncmp(path, "../Documents/", 13) != 0) return path;
+    @autoreleasepool {
+        NSString* rel = [NSString stringWithUTF8String:path+13]; // 跳过 ../Documents/
+        NSString* abs = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:rel];
+        // 确保父目录存在（写模式创建文件时父目录可能不存在）
+        NSString* parentDir = [abs stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+        // v17: 不再检查文件是否存在，直接返回绝对路径
+        // 这样写模式也能正确重定向到沙箱目录
+        strncpy(g_lua_redirect_buf, [abs UTF8String], 1023);
+        g_lua_redirect_buf[1023] = 0;
+        return g_lua_redirect_buf;
     }
-    // ---- 规则2（v22w2 新增）：引擎按进程 CWD 解析后的路径纠正 ----
-    //   2.1.0 上 Lua 的 io.open("../Documents/...","w") 到达 libc 时，路径已被引擎解析成
-    //   "<container>/Documents/DoNotStarveTogether/motd_images/../Documents/DoNotStarveTogether/
-    //    client_save/dst_assets_cache/xxx"，其父目录不存在 => fopen 必失败（用户日志实测）。
-    //   这里用【最后一个】"/DoNotStarveTogether/client_save/" 标记重建正确绝对路径。
-    //   本来就正确形态的路径（引擎自己的读写）strcmp 相等 -> 原样返回，零副作用。
-    {
-        const char* mark = "/DoNotStarveTogether/client_save/";
+    // ---- 规则2（v5.6 新增）：引擎把写路径按「当前目录」预拼成绝对路径后的纠正 ----
+    //   2.1.0 上 Lua 的 io.open("../Documents/...","w") 到达 libc 时，路径已被引擎拼成
+    //   "<容器>/Documents/DoNotStarveTogether/motd_images/../Documents/DoNotStarveTogether/
+    //    client_save/dst_assets_cache/xxx"，其父目录不存在 => fopen 必失败（真机日志实测）。
+    //   这里取最后一个 "/../Documents/" 之后的部分，重锚到 NSHomeDirectory()/Documents/。
+    //   1.4.2 送来的相对路径走上面的规则1；引擎自己那些已正确的绝对路径不含 "/../" => 本规则不动它们。
+    if(path[0] == '/' && strstr(path, "/../Documents/") != NULL) {
+        const char* mark = "/../Documents/";
         const char* hit = NULL;
         const char* scan = path;
         while((scan = strstr(scan, mark)) != NULL) { hit = scan; scan++; }
-        if(hit) {
+        if(hit != NULL) {
             @autoreleasepool {
-                NSString* rest = [NSString stringWithUTF8String:hit + strlen(mark)];
-                NSString* abs = [[[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
-                    stringByAppendingPathComponent:@"DoNotStarveTogether"]
-                    stringByAppendingPathComponent:@"client_save"]
-                    stringByAppendingPathComponent:rest];
-                const char* a = [abs UTF8String];
-                if(a && strcmp(a, path) != 0) {
-                    NSString* parentDir = [abs stringByDeletingLastPathComponent];
-                    [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
-                    strncpy(g_lua_redirect_buf, a, 1023);
-                    g_lua_redirect_buf[1023] = 0;
-                    return g_lua_redirect_buf;
+                // hit + 4 跳过 "/../"，得到以 "Documents/" 开头的相对部分
+                NSString* rel = [NSString stringWithUTF8String:hit + 4];
+                NSString* abs = (rel != nil) ? [NSHomeDirectory() stringByAppendingPathComponent:rel] : nil;
+                if(abs != nil) {
+                    const char* a = [abs UTF8String];
+                    if(a != NULL && strcmp(a, path) != 0) {
+                        NSString* parentDir = [abs stringByDeletingLastPathComponent];
+                        [[NSFileManager defaultManager] createDirectoryAtPath:parentDir
+                            withIntermediateDirectories:YES attributes:nil error:nil];
+                        strncpy(g_lua_redirect_buf, a, 1023);
+                        g_lua_redirect_buf[1023] = 0;
+                        return g_lua_redirect_buf;
+                    }
                 }
             }
         }
@@ -311,55 +313,28 @@ static const char* dst_redirect_databundle(const char* path) {
 
 #define EXTRACT_MODE(flags,mode_var) va_list _ap; va_start(_ap,flags); if(flags&O_CREAT) mode_var=(mode_t)va_arg(_ap,int); va_end(_ap);
 
-// ---- [DIAG] 只观察 dst_assets_cache 相关的文件操作，用于定位 Lua 写盘走哪条路 ----
-static void diag_log(const char* who, const char* path, const char* mode, int flags, const char* red) {
-    if(!path) return;
-    if(!strstr(path, "dst_assets_cache")) return;   /* 只看 Lua 的缓存目录 */
-    /* [v22w] 只报「写模式」：读是 UI 每帧轮询（实测 30s 内 2000+ 次），会把日志刷爆 */
-    if(mode) { if(!strchr(mode,'w') && !strchr(mode,'a') && !strchr(mode,'+')) return; }
-    else     { if((flags & 3) == 0) return; }   /* 低 2 位 = O_RDONLY */
-    if(mode) LOGD("[DIAG] %s(path=%s, mode=%s) -> %s", who, path, mode, red?red:"(no-redirect)");
-    else     LOGD("[DIAG] %s(path=%s, flags=0x%x) -> %s", who, path, flags, red?red:"(no-redirect)");
-}
-
 // ---- file hooks ----
 static int fake_open(const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode);
-    diag_log("fake_open", path, NULL, flags, NULL);
-        if(!g_open_reent) {  /* [兜底] 写模式也重定向 lua_path：2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读；1.4.2 走 fopen(fake_fopen 已管写) 不受影响。databundle 仍仅读 */
-        if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
-        const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
-    }
+    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token(path,orig_open); g_open_reent=0;}
-    diag_log("open-plain", path, NULL, flags, NULL); int fd=orig_open?orig_open(path,flags,mode):open(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
+    int fd=orig_open?orig_open(path,flags,mode):open(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
 static int fake_open_nocancel(const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode); open_t real=orig_open_nocancel?orig_open_nocancel:orig_open;
-    diag_log("fake_open_nocancel", path, NULL, flags, NULL);
-    if(!g_open_reent) {  /* [兜底] 写模式也重定向 lua_path：2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读；1.4.2 走 fopen(fake_fopen 已管写) 不受影响。databundle 仍仅读 */
-        if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=real(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
-        const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=real(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
-    }
+    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=real(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=real(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token(path,real); g_open_reent=0;}
-    diag_log("open-plain", path, NULL, flags, NULL); int fd=real(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
+    int fd=real(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
 static int fake_openat(int dirfd,const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode);
-    diag_log("fake_openat", path, NULL, flags, NULL);
-        if(!g_open_reent) {  /* [兜底] 写模式也重定向 lua_path：2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读；1.4.2 走 fopen(fake_fopen 已管写) 不受影响。databundle 仍仅读 */
-        if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
-        const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
-    }
+    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token_at(path,dirfd,orig_openat); g_open_reent=0;}
     int fd=orig_openat?orig_openat(dirfd,path,flags,mode):openat(dirfd,path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
 static int fake_openat_nocancel(int dirfd,const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode); openat_t real=orig_openat_nocancel?orig_openat_nocancel:orig_openat;
-    diag_log("fake_openat_nocancel", path, NULL, flags, NULL);
-    if(!g_open_reent) {  /* [兜底] 写模式也重定向 lua_path：2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读；1.4.2 走 fopen(fake_fopen 已管写) 不受影响。databundle 仍仅读 */
-        if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
-        const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
-    }
+    if(!g_open_reent && open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} red=dst_redirect_lua_path(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token_at(path,dirfd,real); g_open_reent=0;}
     int fd=real(dirfd,path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
@@ -371,7 +346,6 @@ static int fake_renameat(int oldfd,const char* oldp,int newfd,const char* newp) 
 // ---- C-stdio ----
 static FILE* g_tok_wfile=NULL;
 static FILE* fake_fopen(const char* path,const char* mode) {
-    diag_log("fake_fopen", path, mode, 0, NULL);
     // v17: 对读模式和写模式都做 ../Documents/ 路径重定向
     if(!g_open_reent && mode) {
         // 读模式：先检查 databundle 重定向，再检查 lua_path 重定向
@@ -640,25 +614,6 @@ static void dst_write_cache_file(const char* name, const char* content, int len)
 }
 
 // 读 Documents/dst_assets_cache/ 文件
-/* [v22w] 剥离引擎持久化通道写出的文件头 "KLEI     1 "（KLEI + 空格 + 版本号 + 空格）。
-   背景：2.1.0 引擎把 Lua 的 io.open 写模式直接拒了（写请求到不了 libc —— dylib 的
-   fopen/open/openat/openat_nocancel 钩子一个都拦不到），只能让 Lua 改走引擎自己的
-   保存通道（TheSim:SetPersistentString / SavePersistentString），该通道写出的文件带这个头。
-   1.4.2 走原生 io.open 写入、文件不含头 => 本函数为纯 no-op，对旧版本零影响。 */
-static int dst_strip_klei_header(char* buf, int* plen) {
-    int n = *plen;
-    if(n < 4 || memcmp(buf, "KLEI", 4) != 0) return 0;
-    int i = 4;
-    while(i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
-    while(i < n && buf[i] >= '0' && buf[i] <= '9') i++;
-    if(i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
-    int rest = n - i; if(rest < 0) rest = 0;
-    memmove(buf, buf + i, (size_t)rest);
-    buf[rest] = 0;
-    *plen = rest;
-    return 1;
-}
-
 static int dst_read_cache_file(const char* name, char* buf, int buflen) {
     @autoreleasepool {
         NSString* path = [dst_get_cache_dir() stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
@@ -668,10 +623,6 @@ static int dst_read_cache_file(const char* name, char* buf, int buflen) {
         buf[n] = 0; fclose(f);
         // trim
         while (n > 0 && (buf[n-1]=='\n' || buf[n-1]=='\r' || buf[n-1]==' ')) buf[--n] = 0;
-        // [v22w] 引擎通道写出的文件带头 "KLEI <ver> "：剥掉，否则版本号会被污染
-        if (dst_strip_klei_header(buf, &n)) {
-            LOGD("cache read: stripped KLEI header -> '%s'", buf);
-        }
         return n;
     }
 }
