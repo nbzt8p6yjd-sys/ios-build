@@ -93,7 +93,7 @@ __attribute__((constructor(1)))
 static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB v5.3 strip2 (simplified: no bg-download, no watchdog, skin kept) ===");
+    LOGD("=== DYLIB v5.5 pathfix2 (simplified: no bg-download, no watchdog, skin kept) ===");
     signal(SIGILL,dst_signal_handler); signal(SIGSEGV,dst_signal_handler);
     signal(SIGBUS,dst_signal_handler); signal(SIGABRT,dst_signal_handler);
     signal(SIGTRAP,dst_signal_handler); NSSetUncaughtExceptionHandler(dst_uncaught_handler);
@@ -248,19 +248,47 @@ static int dst_assets_ready(void) {
 static char g_lua_redirect_buf[1024];
 static const char* dst_redirect_lua_path(const char* path) {
     if(!path) return path;
-    // 检查是否是 ../Documents/... 路径
-    if(strncmp(path, "../Documents/", 13) != 0) return path;
-    @autoreleasepool {
-        NSString* rel = [NSString stringWithUTF8String:path+13]; // 跳过 ../Documents/
-        NSString* abs = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:rel];
-        // 确保父目录存在（写模式创建文件时父目录可能不存在）
-        NSString* parentDir = [abs stringByDeletingLastPathComponent];
-        [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
-        // v17: 不再检查文件是否存在，直接返回绝对路径
-        // 这样写模式也能正确重定向到沙箱目录
-        strncpy(g_lua_redirect_buf, [abs UTF8String], 1023);
-        g_lua_redirect_buf[1023] = 0;
-        return g_lua_redirect_buf;
+    // ---- 规则1（原版）：../Documents/... 相对路径 ----
+    if(strncmp(path, "../Documents/", 13) == 0) {
+        @autoreleasepool {
+            NSString* rel = [NSString stringWithUTF8String:path+13]; // 跳过 ../Documents/
+            NSString* abs = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:rel];
+            // 确保父目录存在（写模式创建文件时父目录可能不存在）
+            NSString* parentDir = [abs stringByDeletingLastPathComponent];
+            [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+            strncpy(g_lua_redirect_buf, [abs UTF8String], 1023);
+            g_lua_redirect_buf[1023] = 0;
+            return g_lua_redirect_buf;
+        }
+    }
+    // ---- 规则2（v22w2 新增）：引擎按进程 CWD 解析后的路径纠正 ----
+    //   2.1.0 上 Lua 的 io.open("../Documents/...","w") 到达 libc 时，路径已被引擎解析成
+    //   "<container>/Documents/DoNotStarveTogether/motd_images/../Documents/DoNotStarveTogether/
+    //    client_save/dst_assets_cache/xxx"，其父目录不存在 => fopen 必失败（用户日志实测）。
+    //   这里用【最后一个】"/DoNotStarveTogether/client_save/" 标记重建正确绝对路径。
+    //   本来就正确形态的路径（引擎自己的读写）strcmp 相等 -> 原样返回，零副作用。
+    {
+        const char* mark = "/DoNotStarveTogether/client_save/";
+        const char* hit = NULL;
+        const char* scan = path;
+        while((scan = strstr(scan, mark)) != NULL) { hit = scan; scan++; }
+        if(hit) {
+            @autoreleasepool {
+                NSString* rest = [NSString stringWithUTF8String:hit + strlen(mark)];
+                NSString* abs = [[[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                    stringByAppendingPathComponent:@"DoNotStarveTogether"]
+                    stringByAppendingPathComponent:@"client_save"]
+                    stringByAppendingPathComponent:rest];
+                const char* a = [abs UTF8String];
+                if(a && strcmp(a, path) != 0) {
+                    NSString* parentDir = [abs stringByDeletingLastPathComponent];
+                    [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+                    strncpy(g_lua_redirect_buf, a, 1023);
+                    g_lua_redirect_buf[1023] = 0;
+                    return g_lua_redirect_buf;
+                }
+            }
+        }
     }
     return path;
 }
