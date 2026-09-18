@@ -93,7 +93,7 @@ __attribute__((constructor(1)))
 static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB v5.6 pathfix ===");
+    LOGD("=== DYLIB v5.7 pathfix ===");
     signal(SIGILL,dst_signal_handler); signal(SIGSEGV,dst_signal_handler);
     signal(SIGBUS,dst_signal_handler); signal(SIGABRT,dst_signal_handler);
     signal(SIGTRAP,dst_signal_handler); NSSetUncaughtExceptionHandler(dst_uncaught_handler);
@@ -248,21 +248,23 @@ static int dst_assets_ready(void) {
 static char g_lua_redirect_buf[1024];
 static const char* dst_redirect_lua_path(const char* path) {
     if(!path) return path;
-    // 检查是否是 ../Documents/... 路径
-    if(strncmp(path, "../Documents/", 13) != 0) return path;
-    @autoreleasepool {
-        NSString* rel = [NSString stringWithUTF8String:path+13]; // 跳过 ../Documents/
-        NSString* abs = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:rel];
-        // 确保父目录存在（写模式创建文件时父目录可能不存在）
-        NSString* parentDir = [abs stringByDeletingLastPathComponent];
-        [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
-        // v17: 不再检查文件是否存在，直接返回绝对路径
-        // 这样写模式也能正确重定向到沙箱目录
-        strncpy(g_lua_redirect_buf, [abs UTF8String], 1023);
-        g_lua_redirect_buf[1023] = 0;
-        return g_lua_redirect_buf;
+    // 规则1（原版）：../Documents/... 相对路径 → 重锚到沙箱 Documents
+    //   v5.7：原来是「不匹配就早退」，改成 if 块，好让不匹配的路径继续走下面的规则2
+    if(strncmp(path, "../Documents/", 13) == 0) {
+        @autoreleasepool {
+            NSString* rel = [NSString stringWithUTF8String:path+13]; // 跳过 ../Documents/
+            NSString* abs = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:rel];
+            // 确保父目录存在（写模式创建文件时父目录可能不存在）
+            NSString* parentDir = [abs stringByDeletingLastPathComponent];
+            [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+            // v17: 不再检查文件是否存在，直接返回绝对路径
+            // 这样写模式也能正确重定向到沙箱目录
+            strncpy(g_lua_redirect_buf, [abs UTF8String], 1023);
+            g_lua_redirect_buf[1023] = 0;
+            return g_lua_redirect_buf;
+        }
     }
-    // ---- 规则2（v5.6 新增）：引擎把写路径按「当前目录」预拼成绝对路径后的纠正 ----
+    // ---- 规则2（v5.7 新增）：引擎把写路径按「当前目录」预拼成绝对路径后的纠正 ----
     //   2.1.0 上 Lua 的 io.open("../Documents/...","w") 到达 libc 时，路径已被引擎拼成
     //   "<容器>/Documents/DoNotStarveTogether/motd_images/../Documents/DoNotStarveTogether/
     //    client_save/dst_assets_cache/xxx"，其父目录不存在 => fopen 必失败（真机日志实测）。
