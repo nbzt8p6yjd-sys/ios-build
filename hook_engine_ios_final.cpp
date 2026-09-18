@@ -93,7 +93,7 @@ __attribute__((constructor(1)))
 static void dst_load_marker() {
     if (g_relay_ip == 0) g_relay_ip = inet_addr(DST_RELAY_IP);
     dst_ensure_log();
-    LOGD("=== DYLIB v5.0 (simplified: no bg-download, no watchdog, skin kept) ===");
+    LOGD("=== DYLIB v5.1 diag (simplified: no bg-download, no watchdog, skin kept) ===");
     signal(SIGILL,dst_signal_handler); signal(SIGSEGV,dst_signal_handler);
     signal(SIGBUS,dst_signal_handler); signal(SIGABRT,dst_signal_handler);
     signal(SIGTRAP,dst_signal_handler); NSSetUncaughtExceptionHandler(dst_uncaught_handler);
@@ -283,28 +283,39 @@ static const char* dst_redirect_databundle(const char* path) {
 
 #define EXTRACT_MODE(flags,mode_var) va_list _ap; va_start(_ap,flags); if(flags&O_CREAT) mode_var=(mode_t)va_arg(_ap,int); va_end(_ap);
 
+// ---- [DIAG] 只观察 dst_assets_cache 相关的文件操作，用于定位 Lua 写盘走哪条路 ----
+static void diag_log(const char* who, const char* path, const char* mode, int flags, const char* red) {
+    if(!path) return;
+    if(!strstr(path, "dst_assets_cache")) return;   /* 只看 Lua 的缓存目录 */
+    if(mode) LOGD("[DIAG] %s(path=%s, mode=%s) -> %s", who, path, mode, red?red:"(no-redirect)");
+    else     LOGD("[DIAG] %s(path=%s, flags=0x%x) -> %s", who, path, flags, red?red:"(no-redirect)");
+}
+
 // ---- file hooks ----
 static int fake_open(const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode);
-    if(!g_open_reent) {  /* [兜底] 写模式也重定向 lua_path：2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读；1.4.2 走 fopen(fake_fopen 已管写) 不受影响。databundle 仍仅读 */
+    diag_log("fake_open", path, NULL, flags, NULL);
+        if(!g_open_reent) {  /* [兜底] 写模式也重定向 lua_path：2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读；1.4.2 走 fopen(fake_fopen 已管写) 不受影响。databundle 仍仅读 */
         if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
         const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
     }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token(path,orig_open); g_open_reent=0;}
-    int fd=orig_open?orig_open(path,flags,mode):open(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
+    diag_log("open-plain", path, NULL, flags, NULL); int fd=orig_open?orig_open(path,flags,mode):open(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
 static int fake_open_nocancel(const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode); open_t real=orig_open_nocancel?orig_open_nocancel:orig_open;
+    diag_log("fake_open_nocancel", path, NULL, flags, NULL);
     if(!g_open_reent) {  /* [兜底] 写模式也重定向 lua_path：2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读；1.4.2 走 fopen(fake_fopen 已管写) 不受影响。databundle 仍仅读 */
         if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=real(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
         const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=real(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
     }
     if(!g_open_reent && path_is_cluster_token(path) && open_is_read(flags)){g_open_reent=1; ensure_cluster_token(path,real); g_open_reent=0;}
-    int fd=real(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
+    diag_log("open-plain", path, NULL, flags, NULL); int fd=real(path,flags,mode); record_tok_write_fd(fd,path,flags); return fd;
 }
 static int fake_openat(int dirfd,const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode);
-    if(!g_open_reent) {  /* [兜底] 写模式也重定向 lua_path：2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读；1.4.2 走 fopen(fake_fopen 已管写) 不受影响。databundle 仍仅读 */
+    diag_log("fake_openat", path, NULL, flags, NULL);
+        if(!g_open_reent) {  /* [兜底] 写模式也重定向 lua_path：2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读；1.4.2 走 fopen(fake_fopen 已管写) 不受影响。databundle 仍仅读 */
         if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
         const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
     }
@@ -313,6 +324,7 @@ static int fake_openat(int dirfd,const char* path,int flags,...) {
 }
 static int fake_openat_nocancel(int dirfd,const char* path,int flags,...) {
     mode_t mode=0; EXTRACT_MODE(flags,mode); openat_t real=orig_openat_nocancel?orig_openat_nocancel:orig_openat;
+    diag_log("fake_openat_nocancel", path, NULL, flags, NULL);
     if(!g_open_reent) {  /* [兜底] 写模式也重定向 lua_path：2.1.0 引擎的 Lua io.open 走 posix open，原来只重定向读；1.4.2 走 fopen(fake_fopen 已管写) 不受影响。databundle 仍仅读 */
         if(open_is_read(flags)) { const char* red=dst_redirect_databundle(path); if(red!=path){int rfd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(rfd,path,flags); return rfd;} }
         const char* red=dst_redirect_lua_path(path); if(red!=path){int fd=orig_open?orig_open(red,flags,mode):open(red,flags,mode); record_tok_write_fd(fd,path,flags); return fd;}
@@ -328,16 +340,17 @@ static int fake_renameat(int oldfd,const char* oldp,int newfd,const char* newp) 
 // ---- C-stdio ----
 static FILE* g_tok_wfile=NULL;
 static FILE* fake_fopen(const char* path,const char* mode) {
+    diag_log("fake_fopen", path, mode, 0, NULL);
     // v17: 对读模式和写模式都做 ../Documents/ 路径重定向
     if(!g_open_reent && mode) {
         // 读模式：先检查 databundle 重定向，再检查 lua_path 重定向
         if(mode[0]=='r' && !strchr(mode,'+')) {
-            const char* red=dst_redirect_databundle(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
-            red=dst_redirect_lua_path(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+            const char* red=dst_redirect_databundle(path); if(red!=path) diag_log("fopen", path, mode, 0, red); return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+            red=dst_redirect_lua_path(path); if(red!=path) diag_log("fopen", path, mode, 0, red); return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
         }
         // 写模式：只做 lua_path 重定向（databundle 不需要写重定向）
         if(strchr(mode,'w')||strchr(mode,'a')||strchr(mode,'+')) {
-            const char* red=dst_redirect_lua_path(path); if(red!=path) return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
+            const char* red=dst_redirect_lua_path(path); if(red!=path) diag_log("fopen", path, mode, 0, red); return orig_fopen?orig_fopen(red,mode):fopen(red,mode);
         }
     }
     FILE* f=orig_fopen?orig_fopen(path,mode):fopen(path,mode);
